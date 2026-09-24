@@ -46,5 +46,7 @@ participants to all modes of communication within the project.
 ## Compiler
 
 mkdir build && cd build
+
 cmake -GNinja -DCMAKE_BUILD_TYPE=Debug -DLLVM_ENABLE_PROJECTS=mlir -DLLVM_EXTERNAL_PROJECTS="" -DMLIR_BUILD_EXAMPLES=ON -DLLVM_BUILD_EXAMPLES=ON  -DLLVM_ENABLE_ASSERTIONS=ON ../llvm
+
 ninja
