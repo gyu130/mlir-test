@@ -2,54 +2,62 @@
 #include "MyDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"   // 新增
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 
 namespace {
 
-// ---------------- PrintOp Lowering Pattern（原有保留） ----------------
-struct PrintOpLowering : public mlir::OpRewritePattern<mydialect::PrintOp> {
-  using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;
-  mlir::LogicalResult matchAndRewrite(mydialect::PrintOp op,
-                                      mlir::PatternRewriter &rewriter) const override {
+// ============ PrintOp: mydialect.print → llvm.call ============
+struct PrintOpLowering : public mlir::OpConversionPattern<mydialect::PrintOp> {
+  using OpConversionPattern<mydialect::PrintOp>::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::PrintOp op,
+      typename mydialect::PrintOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto sym = mlir::SymbolRefAttr::get(rewriter.getContext(), "my_runtime_print_i32");
-    //rewriter.create<mlir::LLVM::LLVMCallOp>(loc, mlir::TypeRange{}, sym, op.getInput());
-    mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, op.getValue());
+    mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, adaptor.getValue());
     rewriter.eraseOp(op);
     return mlir::success();
   }
 };
 
-// ---------------- 新增：AddI32Op → arith.addi ----------------
-struct AddI32OpLowering : public mlir::OpRewritePattern<mydialect::AddI32Op> {
-  using OpRewritePattern<mydialect::AddI32Op>::OpRewritePattern;
-  mlir::LogicalResult matchAndRewrite(mydialect::AddI32Op op,
-                                      mlir::PatternRewriter &rewriter) const override {
+// ============ AddI32Op: mydialect.addi → arith.addi ============
+struct AddI32OpLowering : public mlir::OpConversionPattern<mydialect::AddI32Op> {
+  using OpConversionPattern<mydialect::AddI32Op>::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::AddI32Op op,
+      typename mydialect::AddI32Op::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    // mydialect.addi 直接替换为标准 arith.addi
-    //auto newAdd = rewriter.create<mlir::arith::AddIOp>(loc, op.getLhs(), op.getRhs());
-    auto newAdd = mlir::arith::AddIOp::create(rewriter, loc, op.getLhs(), op.getRhs());
+    auto newAdd = mlir::arith::AddIOp::create(
+        rewriter, loc, adaptor.getLhs(), adaptor.getRhs());
     rewriter.replaceOp(op, newAdd.getResult());
     return mlir::success();
   }
 };
 
-// 新增乘法 lowering：mydialect.muli → arith.muli
-struct MuliOpLowering : public mlir::OpRewritePattern<mydialect::MuliOp> {
-  using OpRewritePattern<mydialect::MuliOp>::OpRewritePattern;
-  mlir::LogicalResult matchAndRewrite(mydialect::MuliOp op,
-                                      mlir::PatternRewriter &rewriter) const override {
+// ============ MuliOp: mydialect.muli → arith.muli ============
+struct MuliOpLowering : public mlir::OpConversionPattern<mydialect::MuliOp> {
+  using OpConversionPattern<mydialect::MuliOp>::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::MuliOp op,
+      typename mydialect::MuliOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto newMul = mlir::arith::MulIOp::create(rewriter, loc, op.getLhs(), op.getRhs());
+    auto newMul = mlir::arith::MulIOp::create(
+        rewriter, loc, adaptor.getLhs(), adaptor.getRhs());
     rewriter.replaceOp(op, newMul.getResult());
     return mlir::success();
   }
 };
 
-
+// ============ Pass 定义 ============
 struct LowerMyDialectPrintPass
     : public mlir::PassWrapper<LowerMyDialectPrintPass, mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerMyDialectPrintPass)
@@ -58,13 +66,13 @@ struct LowerMyDialectPrintPass
     return "lower-mydialect-print";
   }
   llvm::StringRef getDescription() const final {
-    return "Lower mydialect.print / addi /muli op to LLVM/Arith dialect";
+    return "Lower mydialect.print / addi / muli to Arith/LLVM dialect";
   }
 
-  // 声明依赖方言，greedy模式最好加上
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
     registry.insert<
         mydialect::MyDialect,
+        mlir::func::FuncDialect,
         mlir::LLVM::LLVMDialect,
         mlir::arith::ArithDialect>();
   }
@@ -72,34 +80,43 @@ struct LowerMyDialectPrintPass
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
     mlir::MLIRContext *ctx = &getContext();
-    ctx->loadDialect<mydialect::MyDialect>();
-    ctx->loadDialect<mlir::LLVM::LLVMDialect>();
-    ctx->loadDialect<mlir::arith::ArithDialect>(); // 新增加载arith
 
+    // --- 1. 插入外部 runtime 函数声明 ---
     mlir::OpBuilder moduleBuilder(module.getBody(), module.getBody()->begin());
     mlir::Type i32Ty = mlir::IntegerType::get(ctx, 32);
     mlir::Type voidTy = mlir::LLVM::LLVMVoidType::get(ctx);
     auto llvmFuncTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty}, false);
-    //moduleBuilder.create<mlir::LLVM::LLVMFuncOp>(
-    mlir::LLVM::LLVMFuncOp::create(moduleBuilder,  
+    mlir::LLVM::LLVMFuncOp::create(moduleBuilder,
         moduleBuilder.getUnknownLoc(),
         "my_runtime_print_i32",
         llvmFuncTy,
         mlir::LLVM::Linkage::External);
 
-    mlir::RewritePatternSet patterns(&getContext());
-    // 使用新统一populate函数
+    // --- 2. ConversionTarget：标记 mydialect op 为非法 ---
+    mlir::ConversionTarget target(*ctx);
+    target.addIllegalOp<mydialect::PrintOp>();
+    target.addIllegalOp<mydialect::AddI32Op>();
+    target.addIllegalOp<mydialect::MuliOp>();
+    // 允许的目标方言
+    target.addLegalDialect<mlir::func::FuncDialect>();
+    target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+    target.addLegalDialect<mlir::arith::ArithDialect>();
+
+    // --- 3. 注册 patterns ---
+    mlir::RewritePatternSet patterns(ctx);
     mydialect::populateMyDialectToLowerPatterns(patterns);
 
-    mlir::GreedyRewriteConfig config;
-    (void)applyPatternsGreedily(module, std::move(patterns), config);
+    // --- 4. applyPartialConversion（替代 applyPatternsGreedily）---
+    if (mlir::failed(mlir::applyPartialConversion(module, target, std::move(patterns)))) {
+      signalPassFailure();
+    }
   }
 };
+
 } // anonymous namespace
 
 namespace mydialect {
 
-// 统一注册全部pattern
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
   patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering>(patterns.getContext());
 }
