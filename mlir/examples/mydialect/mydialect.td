@@ -21,7 +21,13 @@ def PrintOp : Op<MyDialect, "print"> {
   let hasVerifier = 1;
 }
 
-
+def AddI32Op : Op<MyDialect, "addi"> {
+  let summary = "i32 add for mydialect";
+  let description = "Add two i32 operands";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$sum);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($sum)";
+}
 
 #endif
 
