@@ -98,6 +98,69 @@ mlir::LogicalResult mydialect::DivSIOp::verify() {
   return mlir::success();
 }
 
+// AddI32Op: fold(lhs + rhs)
+::mlir::OpFoldResult mydialect::AddI32Op::fold(FoldAdaptor adaptor) {
+  if (!adaptor.getLhs() || !adaptor.getRhs())
+    return nullptr;
+  auto lhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getLhs());
+  auto rhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getRhs());
+  if (!lhsAttr || !rhsAttr)
+    return nullptr;
+
+  int32_t a = lhsAttr.getValue().getSExtValue();
+  int32_t b = rhsAttr.getValue().getSExtValue();
+  auto resType = getResult().getType();
+  return ::mlir::IntegerAttr::get(resType, a + b);
+}
+
+// MuliOp: fold(lhs * rhs)
+::mlir::OpFoldResult mydialect::MuliOp::fold(FoldAdaptor adaptor) {
+  if (!adaptor.getLhs() || !adaptor.getRhs())
+    return nullptr;
+  auto lhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getLhs());
+  auto rhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getRhs());
+  if (!lhsAttr || !rhsAttr)
+    return nullptr;
+
+  int32_t a = lhsAttr.getValue().getSExtValue();
+  int32_t b = rhsAttr.getValue().getSExtValue();
+  auto resType = getResult().getType();
+  return ::mlir::IntegerAttr::get(resType, a * b);
+}
+
+// SubI32Op: fold(lhs - rhs)
+::mlir::OpFoldResult mydialect::SubI32Op::fold(FoldAdaptor adaptor) {
+  if (!adaptor.getLhs() || !adaptor.getRhs())
+    return nullptr;
+  auto lhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getLhs());
+  auto rhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getRhs());
+  if (!lhsAttr || !rhsAttr)
+    return nullptr;
+
+  int32_t a = lhsAttr.getValue().getSExtValue();
+  int32_t b = rhsAttr.getValue().getSExtValue();
+  auto resType = getResult().getType();
+  return ::mlir::IntegerAttr::get(resType, a - b);
+}
+
+// DivSIOp: fold(lhs / rhs)，除数为0不折叠
+::mlir::OpFoldResult mydialect::DivSIOp::fold(FoldAdaptor adaptor) {
+  if (!adaptor.getLhs() || !adaptor.getRhs())
+    return nullptr;
+  auto lhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getLhs());
+  auto rhsAttr = mlir::dyn_cast<::mlir::IntegerAttr>(adaptor.getRhs());
+  if (!lhsAttr || !rhsAttr)
+    return nullptr;
+
+  int32_t a = lhsAttr.getValue().getSExtValue();
+  int32_t b = rhsAttr.getValue().getSExtValue();
+  if (b == 0)
+    return nullptr;
+
+  auto resType = getResult().getType();
+  return ::mlir::IntegerAttr::get(resType, a / b);
+}
+
 
 struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> {
   using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;

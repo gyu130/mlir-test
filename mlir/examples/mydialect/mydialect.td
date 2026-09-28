@@ -27,6 +27,7 @@ def AddI32Op : Op<MyDialect, "addi"> {
   let arguments = (ins I32:$lhs, I32:$rhs);
   let results = (outs I32:$sum);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($sum)";
+  let hasFolder = 1;
 }
 
 def MuliOp : Op<MyDialect, "muli"> {
@@ -35,6 +36,7 @@ def MuliOp : Op<MyDialect, "muli"> {
   let arguments = (ins I32:$lhs, I32:$rhs);
   let results = (outs I32:$product);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($product)";
+  let hasFolder = 1;
 }
 
 def SubI32Op : Op<MyDialect, "subi"> {
@@ -43,6 +45,7 @@ def SubI32Op : Op<MyDialect, "subi"> {
   let arguments = (ins I32:$lhs, I32:$rhs);
   let results = (outs I32:$diff);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($diff)";
+  let hasFolder = 1;
 }
 
 def DivSIOp : Op<MyDialect, "divi_s"> {
@@ -52,6 +55,7 @@ def DivSIOp : Op<MyDialect, "divi_s"> {
   let results = (outs I32:$quotient);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($quotient)";
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 #endif
