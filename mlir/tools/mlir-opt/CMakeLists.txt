@@ -88,7 +88,8 @@ mlir_target_link_libraries(MLIRMlirOptMain PUBLIC
 
 add_mlir_tool(mlir-opt
   mlir-opt.cpp
-
+  ${MLIR_SOURCE_DIR}/examples/mydialect/MyDialect.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/pass.cpp
   SUPPORT_PLUGINS
   )
 mlir_target_link_libraries(mlir-opt PRIVATE ${LIBS})
@@ -97,3 +98,19 @@ llvm_update_compile_flags(mlir-opt)
 
 mlir_check_all_link_libraries(mlir-opt)
 export_executable_symbols_for_plugins(mlir-opt)
+
+# 把 mydialect 的源码目录加入头文件搜索路径
+target_include_directories(mlir-opt PRIVATE
+  ${MLIR_SOURCE_DIR}/examples
+  ${MLIR_BINARY_DIR}/examples
+  ${MLIR_BINARY_DIR}/examples/mydialect
+)
+# MLIRMlirOptMain 库也要加，因为它同样编译 mlir-opt.cpp
+target_include_directories(MLIRMlirOptMain PRIVATE
+  ${MLIR_SOURCE_DIR}/examples
+  ${MLIR_BINARY_DIR}/examples
+  ${MLIR_BINARY_DIR}/examples/mydialect
+)
+
+add_dependencies(MLIRMlirOptMain MyDialectTableGen)
+add_dependencies(mlir-opt MyDialectTableGen)

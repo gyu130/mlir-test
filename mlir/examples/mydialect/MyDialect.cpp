@@ -8,7 +8,33 @@
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
+namespace {
+
+struct PrintOpLowering : public mlir::OpRewritePattern<mydialect::PrintOp> {
+  using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(mydialect::PrintOp printOp,
+                                      mlir::PatternRewriter &rewriter) const override {
+  auto i32Ty = rewriter.getI32Type();
+  // ✅ 修复：使用 LLVMVoidType，不是 getNoneType()
+  auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+  auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
+
+  auto funcSym = mlir::SymbolRefAttr::get(printOp.getContext(), "my_runtime_print_i32");
+  rewriter.create<mlir::LLVM::CallOp>(printOp.getLoc(), funcTy, funcSym, printOp.getOperand());
+  rewriter.eraseOp(printOp);
+  return mlir::success();
+
+
+  }
+};
+} // anonymous namespace
+
 
 namespace mydialect {
 
@@ -47,6 +73,7 @@ mlir::ParseResult PrintOp::parse(mlir::OpAsmParser &parser,
 
 mlir::LogicalResult PrintOp::verify() {
 	    mlir::Type opTy = getOperand().getType();
+	    //auto intTy = dyn_cast<mlir::InterType>();
 	    if (!opTy.isInteger()){
 	        return emitOpError() << "operand must be integer type, but got " << opTy;         
 	    }
@@ -64,7 +91,8 @@ struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> 
                                       mlir::PatternRewriter &rewriter) const override {
     // 构造LLVM函数类型 void(i32)
     auto i32Ty = rewriter.getI32Type();
-    auto funcTy = mlir::LLVM::LLVMFunctionType::get(rewriter.getNoneType(), {i32Ty});
+    auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+    auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
 
     // 获取符号，对应我们宿主 extern "C" my_runtime_print_i32
     auto func = mlir::SymbolRefAttr::get(op.getContext(), "my_runtime_print_i32");
@@ -78,6 +106,7 @@ struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> 
 // 对外暴露，mydriver里面可以调用这个pattern集合
 void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns) {
   patterns.add<PrintOpToLLVMRewrite>(patterns.getContext());
+  //patterns.add<PrintOpLowering>(patterns.getContext());
 }
 
 } // namespace mydialect
@@ -86,3 +115,4 @@ void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns) {
 // 生成各 Op 的方法定义（build/create/verify 等）及 TypeID 定义
 #define GET_OP_CLASSES
 #include "mydialect-opdefs.cpp.inc"
+

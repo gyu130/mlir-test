@@ -1,14 +1,14 @@
 #ifndef MYDIALECT_H
 #define MYDIALECT_H
 
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
+#include "mlir/IR/BuiltinOps.h"
 
 // TableGen 生成的 Op 类声明（定义 GET_OP_CLASSES 以获取完整类声明，而非仅前置声明）
 #define GET_OP_CLASSES
@@ -20,8 +20,8 @@
 
 namespace mydialect {
 void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns);
-
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass();
-
+#if 0
+std::unique_ptr<mlir::Pass> createLowerMyDialectPrintPass();
+#endif
 }
 #endif
