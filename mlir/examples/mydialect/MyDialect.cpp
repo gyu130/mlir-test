@@ -12,6 +12,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Matchers.h"
 
 namespace {
 
@@ -82,7 +83,21 @@ mlir::LogicalResult PrintOp::verify() {
     	    }
 
 	    return mlir::success();
-     }
+}
+
+// divi_s verifier
+mlir::LogicalResult mydialect::DivSIOp::verify() {
+  mlir::Operation *op = getOperation();
+  mlir::Value rhs = op->getOperand(1);
+  mlir::APInt val;
+  if (mlir::matchPattern(rhs, mlir::m_ConstantInt(&val))) {
+    if (val.isZero()) {
+      return op->emitOpError() << "divi_s: division by zero constant";
+    }
+  }
+  return mlir::success();
+}
+
 
 struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> {
   using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;

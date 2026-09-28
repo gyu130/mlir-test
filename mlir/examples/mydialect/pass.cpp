@@ -57,6 +57,40 @@ struct MuliOpLowering : public mlir::OpConversionPattern<mydialect::MuliOp> {
   }
 };
 
+// ============ SubI32Op: mydialect.subi → arith.subi ============
+struct SubI32OpLowering : public mlir::OpConversionPattern<mydialect::SubI32Op> {
+  using OpConversionPattern<mydialect::SubI32Op>::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::SubI32Op op,
+      typename mydialect::SubI32Op::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto newSub = mlir::arith::SubIOp::create(
+        rewriter, loc, adaptor.getLhs(), adaptor.getRhs());
+    rewriter.replaceOp(op, newSub.getResult());
+    return mlir::success();
+  }
+};
+
+// ============ DivSIOp: mydialect.divi_s → arith.divis ============
+struct DivSIOpLowering : public mlir::OpConversionPattern<mydialect::DivSIOp> {
+  using OpConversionPattern<mydialect::DivSIOp>::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::DivSIOp op,
+      typename mydialect::DivSIOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto newDiv = mlir::arith::DivSIOp::create(
+        rewriter, loc, adaptor.getLhs(), adaptor.getRhs());
+    rewriter.replaceOp(op, newDiv.getResult());
+    return mlir::success();
+  }
+};
+
+
+
 // ============ Pass 定义 ============
 struct LowerMyDialectPrintPass
     : public mlir::PassWrapper<LowerMyDialectPrintPass, mlir::OperationPass<mlir::ModuleOp>> {
@@ -97,6 +131,8 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::PrintOp>();
     target.addIllegalOp<mydialect::AddI32Op>();
     target.addIllegalOp<mydialect::MuliOp>();
+    target.addIllegalOp<mydialect::SubI32Op>();
+    target.addIllegalOp<mydialect::DivSIOp>();
     // 允许的目标方言
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
@@ -118,7 +154,7 @@ struct LowerMyDialectPrintPass
 namespace mydialect {
 
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
-  patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering>(patterns.getContext());
+  patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering, SubI32OpLowering, DivSIOpLowering>(patterns.getContext());
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass() {

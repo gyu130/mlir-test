@@ -37,5 +37,22 @@ def MuliOp : Op<MyDialect, "muli"> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($product)";
 }
 
+def SubI32Op : Op<MyDialect, "subi"> {
+  let summary = "i32 subtract for mydialect";
+  let description = "Subtract two i32 operands";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$diff);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($diff)";
+}
+
+def DivSIOp : Op<MyDialect, "divi_s"> {
+  let summary = "signed i32 divide for mydialect";
+  let description = "Signed divide two i32 operands";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$quotient);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($quotient)";
+  let hasVerifier = 1;
+}
+
 #endif
 
