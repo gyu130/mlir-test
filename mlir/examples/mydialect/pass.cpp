@@ -37,6 +37,19 @@ struct AddI32OpLowering : public mlir::OpRewritePattern<mydialect::AddI32Op> {
   }
 };
 
+// 新增乘法 lowering：mydialect.muli → arith.muli
+struct MuliOpLowering : public mlir::OpRewritePattern<mydialect::MuliOp> {
+  using OpRewritePattern<mydialect::MuliOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mydialect::MuliOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto newMul = mlir::arith::MulIOp::create(rewriter, loc, op.getLhs(), op.getRhs());
+    rewriter.replaceOp(op, newMul.getResult());
+    return mlir::success();
+  }
+};
+
+
 struct LowerMyDialectPrintPass
     : public mlir::PassWrapper<LowerMyDialectPrintPass, mlir::OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerMyDialectPrintPass)
@@ -45,7 +58,7 @@ struct LowerMyDialectPrintPass
     return "lower-mydialect-print";
   }
   llvm::StringRef getDescription() const final {
-    return "Lower mydialect.print and mydialect.addi op to LLVM/Arith dialect";
+    return "Lower mydialect.print / addi /muli op to LLVM/Arith dialect";
   }
 
   // 声明依赖方言，greedy模式最好加上
@@ -88,7 +101,7 @@ namespace mydialect {
 
 // 统一注册全部pattern
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
-  patterns.add<PrintOpLowering, AddI32OpLowering>(patterns.getContext());
+  patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering>(patterns.getContext());
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass() {

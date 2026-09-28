@@ -29,5 +29,13 @@ def AddI32Op : Op<MyDialect, "addi"> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($sum)";
 }
 
+def MuliOp : Op<MyDialect, "muli"> {
+  let summary = "i32 multiply for mydialect";
+  let description = "Multiply two i32 operands";
+  let arguments = (ins I32:$lhs, I32:$rhs);
+  let results = (outs I32:$product);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($product)";
+}
+
 #endif
 
