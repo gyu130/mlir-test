@@ -99,6 +99,15 @@ mlir::LogicalResult mydialect::DivSIOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult CmpiOp::verify() {
+  auto pred = getPredicate();
+  llvm::SmallVector<llvm::StringRef,6> validPreds = {"slt","sgt","sle","sge","eq","ne"};
+  bool ok = llvm::is_contained(validPreds, pred);
+  if (!ok)
+    return emitOpError() << "invalid predicate " << pred;
+  return mlir::success();
+}
+
 // AddI32Op: fold(lhs + rhs)
 ::mlir::OpFoldResult mydialect::AddI32Op::fold(FoldAdaptor adaptor) {
   if (!adaptor.getLhs() || !adaptor.getRhs())

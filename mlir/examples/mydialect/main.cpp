@@ -4,6 +4,8 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
@@ -17,9 +19,10 @@
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "llvm/Support/TargetSelect.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+
 
 extern "C" void my_runtime_print_i32(int32_t val) {
 	fprintf(stdout, "[my-runtime-print] value = %d\n", val);
@@ -40,11 +43,14 @@ int main(int argc, char** argv) {
   mlir::registerLLVMDialectTranslation(registry);
   mlir::registerBuiltinDialectTranslation(registry);
 
+  registry.insert<mlir::scf::SCFDialect>();
+
   mlir::MLIRContext ctx(registry);
   ctx.loadDialect<mydialect::MyDialect>();
   ctx.loadDialect<mlir::func::FuncDialect>();
   ctx.loadDialect<mlir::arith::ArithDialect>();
   ctx.loadDialect<mlir::LLVM::LLVMDialect>();
+
 
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(argv[1], &ctx);
   if (!module) {

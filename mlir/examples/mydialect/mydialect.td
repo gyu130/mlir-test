@@ -62,5 +62,13 @@ def DivSIOp : Op<MyDialect, "divi_s"> {
   //let hasCanonicalizer = 1;
 }
 
+// mydialect.cmpi slt, %a, %b : i32  →  i1
+def CmpiOp : Op<MyDialect, "cmpi"> {
+  let arguments = (ins I32:$lhs, I32:$rhs, StrAttr:$predicate);
+  let results = (outs I1:$res);
+  let assemblyFormat = "$lhs `,` $rhs `,` $predicate `:` type($lhs) attr-dict";
+  let hasVerifier = 1;
+}
+
 #endif
 

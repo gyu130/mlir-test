@@ -1,5 +1,7 @@
 #include "pass.h"
 #include "MyDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -123,10 +125,12 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::MuliOp>();
     target.addIllegalOp<mydialect::SubI32Op>();
     target.addIllegalOp<mydialect::DivSIOp>();
+    target.addIllegalOp<mydialect::CmpiOp>();
     // 允许的目标方言
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addLegalDialect<mlir::arith::ArithDialect>();
+    target.addLegalDialect<mlir::scf::SCFDialect>();
     // --- 3. 注册 patterns ---
     mlir::RewritePatternSet patterns(ctx);
     mydialect::populateMyDialectToLowerPatterns(patterns);
@@ -236,13 +240,38 @@ struct ConstantFoldMyDialectPass
   }
 };
 
+// ============ CmpiOp: mydialect.cmpi → arith.cmpi ============
+struct CmpiOpLowering : public mlir::OpConversionPattern<mydialect::CmpiOp> {
+  using OpConversionPattern<mydialect::CmpiOp>::OpConversionPattern;
 
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::CmpiOp op,
+      typename mydialect::CmpiOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto predStr = op.getPredicate();
+
+    mlir::arith::CmpIPredicate pred;
+    if (predStr == "slt") pred = mlir::arith::CmpIPredicate::slt;
+    else if (predStr == "sgt") pred = mlir::arith::CmpIPredicate::sgt;
+    else if (predStr == "sle") pred = mlir::arith::CmpIPredicate::sle;
+    else if (predStr == "sge") pred = mlir::arith::CmpIPredicate::sge;
+    else if (predStr == "eq")  pred = mlir::arith::CmpIPredicate::eq;
+    else if (predStr == "ne")  pred = mlir::arith::CmpIPredicate::ne;
+    else return rewriter.notifyMatchFailure(op, "unsupported predicate: " + predStr);
+
+    auto newCmp = mlir::arith::CmpIOp::create(
+        rewriter, loc, pred, adaptor.getLhs(), adaptor.getRhs());
+    rewriter.replaceOp(op, newCmp.getResult());
+    return mlir::success();
+  }
+};
 
 } // anonymous namespace
 
 namespace mydialect {
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
-  patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering, SubI32OpLowering, DivSIOpLowering>(patterns.getContext());
+  patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering, SubI32OpLowering, DivSIOpLowering, CmpiOpLowering>(patterns.getContext());
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass() {
