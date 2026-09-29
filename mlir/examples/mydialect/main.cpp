@@ -22,6 +22,7 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "llvm/Support/TargetSelect.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 
 
 extern "C" void my_runtime_print_i32(int32_t val) {
@@ -40,6 +41,7 @@ int main(int argc, char** argv) {
   mlir::DialectRegistry registry;
   mlir::arith::registerConvertArithToLLVMInterface(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
+  mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
   mlir::registerLLVMDialectTranslation(registry);
   mlir::registerBuiltinDialectTranslation(registry);
 
@@ -66,6 +68,9 @@ int main(int argc, char** argv) {
   optPM.addPass(mydialect::createConstantFoldMyDialectPass());
   optPM.addPass(mydialect::createLowerMyDialectPrintPass());
   optPM.addPass(mlir::createCanonicalizerPass());
+  // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）
+  optPM.addPass(mlir::createSCFToControlFlowPass());
+  // cf -> llvm 等方言到 LLVM 的转换
   optPM.addPass(mlir::createConvertToLLVMPass());
 
   if (mlir::failed(optPM.run(module.get()))) {

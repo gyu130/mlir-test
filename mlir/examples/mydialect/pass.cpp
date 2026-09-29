@@ -103,7 +103,8 @@ struct LowerMyDialectPrintPass
         mydialect::MyDialect,
         mlir::func::FuncDialect,
         mlir::LLVM::LLVMDialect,
-        mlir::arith::ArithDialect>();
+        mlir::arith::ArithDialect,
+        mlir::scf::SCFDialect>();
   }
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
@@ -126,6 +127,7 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::SubI32Op>();
     target.addIllegalOp<mydialect::DivSIOp>();
     target.addIllegalOp<mydialect::CmpiOp>();
+    target.addIllegalOp<mydialect::YieldOp>();
     // 允许的目标方言
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
@@ -267,11 +269,62 @@ struct CmpiOpLowering : public mlir::OpConversionPattern<mydialect::CmpiOp> {
   }
 };
 
+struct ForOpLowering : public mlir::OpConversionPattern<mydialect::ForOp> {
+  using mlir::OpConversionPattern<mydialect::ForOp>::OpConversionPattern;
+
+  mlir::LogicalResult matchAndRewrite(mydialect::ForOp op,
+                                      mydialect::ForOp::Adaptor adaptor,
+                                      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    // scf.for 的边界/归纳变量为 index 类型，先把 i32 边界转成 index
+    auto castToIndex = [&](mlir::Value v) {
+      return mlir::arith::IndexCastOp::create(
+          rewriter, loc, rewriter.getIndexType(), v);
+    };
+    mlir::Value lower = castToIndex(adaptor.getLower());
+    mlir::Value upper = castToIndex(adaptor.getUpper());
+    mlir::Value step  = castToIndex(adaptor.getStep());
+
+    // 创建 scf.for（无迭代参数时 build 会自动生成空块和 scf.yield）
+    auto scfFor = mlir::scf::ForOp::create(rewriter, loc, lower, upper, step);
+    mlir::Block *dstBlock = scfFor.getBody();
+
+    // 移除自动生成的 scf.yield，稍后用 mydialect.yield 转换后的代替
+    rewriter.eraseOp(dstBlock->getTerminator());
+
+    // 循环体入口：把 index 归纳变量转回 i32，供原 mydialect 循环体使用
+    rewriter.setInsertionPointToStart(dstBlock);
+    mlir::Value ivI32 = mlir::arith::IndexCastOp::create(
+        rewriter, loc, rewriter.getI32Type(), scfFor.getInductionVar());
+
+    // 把原 body 块拼接到 scf.for body，i32 块参数 %i 替换为 ivI32
+    mlir::Block *srcBlock = &op.getBody().front();
+    rewriter.inlineBlockBefore(srcBlock, dstBlock, dstBlock->end(), {ivI32});
+
+    // mydialect.yield -> scf.yield
+    auto oldYield = llvm::cast<mydialect::YieldOp>(dstBlock->getTerminator());
+    rewriter.setInsertionPoint(oldYield);
+    mlir::scf::YieldOp::create(rewriter, loc);
+    rewriter.eraseOp(oldYield);
+
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+
 } // anonymous namespace
 
 namespace mydialect {
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
-  patterns.add<PrintOpLowering, AddI32OpLowering, MuliOpLowering, SubI32OpLowering, DivSIOpLowering, CmpiOpLowering>(patterns.getContext());
+  patterns.add<PrintOpLowering, 
+	AddI32OpLowering, 
+	MuliOpLowering, 
+	SubI32OpLowering, 
+	DivSIOpLowering, 
+	CmpiOpLowering,
+	ForOpLowering>(patterns.getContext());
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass() {

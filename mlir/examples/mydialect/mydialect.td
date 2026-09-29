@@ -70,5 +70,24 @@ def CmpiOp : Op<MyDialect, "cmpi"> {
   let hasVerifier = 1;
 }
 
+def ForOp : Op<MyDialect, "for"> {
+  // 入参：lower, upper, step；迭代变量region参数
+  let arguments = (ins I32:$lower, I32:$upper, I32:$step);
+  let regions = (region SizedRegion<1>:$body);
+  let results = (outs);
+
+  let assemblyFormat = "$lower `,` $upper `,` $step attr-dict `:` $body";
+  //let hasVerifier = 1;
+}
+
+// mydialect.for 循环体终结符；降低时转换为 scf.yield
+def YieldOp : Op<MyDialect, "yield",
+      [Terminator, ParentOneOf<["ForOp"]>]> {
+  let summary = "terminator for mydialect.for body";
+  let arguments = (ins);
+  let results = (outs);
+  let assemblyFormat = "attr-dict";
+}
+
 #endif
 
