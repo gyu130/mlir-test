@@ -160,7 +160,8 @@ struct FoldMuliPattern : public mlir::RewritePattern {
     int64_t res = lhs * rhs;
 
     // ========== 修复这一行 ==========
-    auto newConst = rewriter.create<mlir::arith::ConstantOp>(op->getLoc(), rewriter.getI32IntegerAttr(res));
+    mlir::ImplicitLocOpBuilder ib(op->getLoc(), rewriter);
+    auto newConst = mlir::arith::ConstantOp::create(ib, rewriter.getI32IntegerAttr(res));
     rewriter.replaceOp(op, newConst);
     return mlir::success();
   }
@@ -189,7 +190,8 @@ struct FoldAddiPattern : public mlir::RewritePattern {
     int64_t res = lhs + rhs;
 
     // ========== 修复这一行 ==========
-    auto newConst = rewriter.create<mlir::arith::ConstantOp>(op->getLoc(), rewriter.getI32IntegerAttr(res));
+    mlir::ImplicitLocOpBuilder ib(op->getLoc(), rewriter);
+    auto newConst = mlir::arith::ConstantOp::create(ib, rewriter.getI32IntegerAttr(res));
     rewriter.replaceOp(op, newConst);
     return mlir::success();
   }
@@ -209,10 +211,7 @@ struct ConstantFoldMyDialectPattern : public mlir::RewritePattern {
     auto typedAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr);
     if (!typedAttr)
       return mlir::failure();
-    //auto loc = op->getLoc();
     // ========== 修复这一行 ==========
-    //auto cstOp = rewriter.create<mlir::arith::ConstantOp>(loc, typedAttr);
-    //rewriter.replaceOp(op, cstOp);
     llvm::errs() << "[DEBUG] PrintOp sees constant value: " << typedAttr.getInt() << "\n";
     return mlir::failure(); //没有改动IR，返回success会触发无限迭代
   }
