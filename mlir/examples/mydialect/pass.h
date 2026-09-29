@@ -20,5 +20,7 @@ inline void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns) {
     populateMyDialectToLowerPatterns(patterns);
 }
 
+void registerConstantFoldMyDialectPass();
+std::unique_ptr<mlir::Pass> createConstantFoldMyDialectPass();
 } // namespace mydialect
 

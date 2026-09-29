@@ -57,6 +57,7 @@ int main(int argc, char** argv) {
 
   // Pass流水线
   mlir::PassManager optPM(&ctx);
+  optPM.addPass(mydialect::createConstantFoldMyDialectPass());
   optPM.addPass(mydialect::createLowerMyDialectPrintPass());
   optPM.addPass(mlir::createCanonicalizerPass());
   optPM.addPass(mlir::createConvertToLLVMPass());

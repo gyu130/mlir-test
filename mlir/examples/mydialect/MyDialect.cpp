@@ -13,6 +13,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
 
 namespace {
 
@@ -27,7 +28,7 @@ struct PrintOpLowering : public mlir::OpRewritePattern<mydialect::PrintOp> {
   auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
 
   auto funcSym = mlir::SymbolRefAttr::get(printOp.getContext(), "my_runtime_print_i32");
-  rewriter.create<mlir::LLVM::CallOp>(printOp.getLoc(), funcTy, funcSym, printOp.getOperand());
+  mlir::LLVM::CallOp::create(rewriter, printOp.getLoc(), funcTy, funcSym, printOp.getOperand());
   rewriter.eraseOp(printOp);
   return mlir::success();
 
@@ -161,7 +162,6 @@ mlir::LogicalResult mydialect::DivSIOp::verify() {
   return ::mlir::IntegerAttr::get(resType, a / b);
 }
 
-
 struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> {
   using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;
 
@@ -174,7 +174,7 @@ struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> 
 
     // 获取符号，对应我们宿主 extern "C" my_runtime_print_i32
     auto func = mlir::SymbolRefAttr::get(op.getContext(), "my_runtime_print_i32");
-    rewriter.create<mlir::LLVM::CallOp>(op.getLoc(), funcTy, func, op.getOperand());
+    mlir::LLVM::CallOp::create(rewriter, op.getLoc(), funcTy, func, op.getOperand());
     rewriter.eraseOp(op);
     return mlir::success();
   }
