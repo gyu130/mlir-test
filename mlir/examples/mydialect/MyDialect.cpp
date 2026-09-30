@@ -12,6 +12,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -70,6 +71,110 @@ mlir::ParseResult PrintOp::parse(mlir::OpAsmParser &parser,
     return mlir::failure();
   if (parser.resolveOperand(valueOperand, valueType, result.operands))
     return mlir::failure();
+  return mlir::success();
+}
+
+// -------- ForOp helpers & custom assembly --------
+mlir::Value ForOp::getInductionVar() {
+  return getBody().getArgument(0);
+}
+
+mlir::ValueRange ForOp::getRegionIterArgs() {
+  return getBody().getArguments().drop_front();
+}
+
+void ForOp::print(mlir::OpAsmPrinter &p) {
+  p << " " << getInductionVar() << " = " << getLower() << " to "
+    << getUpper() << " step " << getStep();
+
+  auto initArgs = getIterArgs();
+  auto regionArgs = getRegionIterArgs();
+  if (!initArgs.empty()) {
+    p << " iter_args(";
+    for (unsigned i = 0; i < initArgs.size(); ++i) {
+      if (i > 0) p << ", ";
+      p << regionArgs[i] << " = " << initArgs[i];
+    }
+    p << ")";
+    p << " -> (" << initArgs.getTypes() << ")";
+  }
+  p << ' ';
+  // 类型标注（本方言中 iv 与边界均为 i32）
+  p << ": " << getLower().getType() << ' ';
+  p.printRegion(getRegion(),
+                /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/!initArgs.empty());
+  p.printOptionalAttrDict((*this)->getAttrs());
+}
+
+mlir::ParseResult ForOp::parse(mlir::OpAsmParser &parser,
+                                mlir::OperationState &result) {
+  mlir::OpAsmParser::Argument iv;
+  mlir::OpAsmParser::UnresolvedOperand lb, ub, step;
+
+  // %iv = %lb to %ub step %step
+  if (parser.parseOperand(iv.ssaName) || parser.parseEqual() ||
+      parser.parseOperand(lb) || parser.parseKeyword("to") ||
+      parser.parseOperand(ub) || parser.parseKeyword("step") ||
+      parser.parseOperand(step))
+    return mlir::failure();
+
+  // 可选 iter_args
+  llvm::SmallVector<mlir::OpAsmParser::Argument, 4> regionArgs;
+  llvm::SmallVector<mlir::OpAsmParser::UnresolvedOperand, 4> operands;
+  regionArgs.push_back(iv);
+
+  bool hasIterArgs = succeeded(parser.parseOptionalKeyword("iter_args"));
+  if (hasIterArgs) {
+    if (parser.parseAssignmentList(regionArgs, operands) ||
+        parser.parseArrowTypeList(result.types))
+      return mlir::failure();
+  }
+
+  // ": i32"
+  mlir::Type type;
+  if (parser.parseColon() || parser.parseType(type))
+    return mlir::failure();
+
+  // 设置 region 块参数类型
+  regionArgs.front().type = type; // iv
+  for (auto [iterArg, resType] :
+       llvm::zip_equal(llvm::drop_begin(regionArgs), result.types))
+    iterArg.type = resType;
+
+  // 解析循环体
+  mlir::Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return mlir::failure();
+
+  // 确保有 YieldOp terminator
+  if (!body->empty()) {
+    mlir::Block &blk = body->front();
+    if (blk.empty() || !llvm::isa<mydialect::YieldOp>(blk.back())) {
+      mlir::OpBuilder builder(parser.getContext());
+      builder.setInsertionPointToEnd(&blk);
+      mydialect::YieldOp::create(builder, result.location, mlir::ValueRange{});
+    }
+  }
+
+  // 解析操作数
+  if (parser.resolveOperand(lb, type, result.operands) ||
+      parser.resolveOperand(ub, type, result.operands) ||
+      parser.resolveOperand(step, type, result.operands))
+    return mlir::failure();
+
+  if (hasIterArgs) {
+    for (auto [arg, operand, resType] :
+         llvm::zip_equal(llvm::drop_begin(regionArgs), operands, result.types)) {
+      arg.type = resType;
+      if (parser.resolveOperand(operand, resType, result.operands))
+        return mlir::failure();
+    }
+  }
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return mlir::failure();
+
   return mlir::success();
 }
 
@@ -169,6 +274,138 @@ mlir::LogicalResult CmpiOp::verify() {
 
   auto resType = getResult().getType();
   return ::mlir::IntegerAttr::get(resType, a / b);
+}
+
+/// 常量折叠接口：ForOp
+mlir::LogicalResult ForOp::fold(FoldAdaptor adaptor,
+                                llvm::SmallVectorImpl<mlir::OpFoldResult> &results) {
+  if (!adaptor.getLower() || !adaptor.getUpper() || !adaptor.getStep())
+    return mlir::failure();
+  auto lowerAttr = mlir::dyn_cast<mlir::IntegerAttr>(adaptor.getLower());
+  auto upperAttr = mlir::dyn_cast<mlir::IntegerAttr>(adaptor.getUpper());
+  auto stepAttr  = mlir::dyn_cast<mlir::IntegerAttr>(adaptor.getStep());
+  if(!lowerAttr || !upperAttr || !stepAttr){
+      return mlir::failure();
+  }
+  int32_t lo = (int32_t)lowerAttr.getInt();
+  int32_t hi = (int32_t)upperAttr.getInt();
+  int32_t st = (int32_t)stepAttr.getInt();
+
+  // case1：循环一次都不执行，直接返回iter_args初始值
+  bool noIteration = ((st>0 && lo >= hi) || (st<0 && lo <= hi));
+  if(noIteration){
+      // results 填充所有 iter_args 操作数
+      for(size_t i=3; i < getNumOperands(); ++i){
+          results.push_back(getOperand(i));
+      }
+      return mlir::success();
+  }
+
+  // case2：有限小常量循环完整求值由 ConstantEvaluateForPattern 完成（见 pass.cpp）
+  return mlir::failure();
+}
+
+} // namespace mydialect
+
+// ============== canonicalize patterns（TD 中 hasCanonicalizer = 1）==============
+namespace {
+
+// 判断 Value 是否为值为 intVal 的常量整数
+static bool isConstantInt(mlir::Value v, int64_t intVal) {
+  mlir::APInt cst;
+  return mlir::matchPattern(v, mlir::m_ConstantInt(&cst)) &&
+         cst.getSExtValue() == intVal;
+}
+
+// addi: x + 0 -> x / 0 + x -> x
+struct AddiZeroCanon : public mlir::OpRewritePattern<mydialect::AddI32Op> {
+  using OpRewritePattern<mydialect::AddI32Op>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mydialect::AddI32Op op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    if (isConstantInt(op.getRhs(), 0)) {
+      rewriter.replaceOp(op, op.getLhs());
+      return mlir::success();
+    }
+    if (isConstantInt(op.getLhs(), 0)) {
+      rewriter.replaceOp(op, op.getRhs());
+      return mlir::success();
+    }
+    return mlir::failure();
+  }
+};
+
+// subi: x - 0 -> x
+struct SubiZeroCanon : public mlir::OpRewritePattern<mydialect::SubI32Op> {
+  using OpRewritePattern<mydialect::SubI32Op>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mydialect::SubI32Op op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    if (isConstantInt(op.getRhs(), 0)) {
+      rewriter.replaceOp(op, op.getLhs());
+      return mlir::success();
+    }
+    return mlir::failure();
+  }
+};
+
+// muli: x * 1 -> x / 1 * x -> x；x * 0 -> 0 / 0 * x -> 0
+struct MuliOneCanon : public mlir::OpRewritePattern<mydialect::MuliOp> {
+  using OpRewritePattern<mydialect::MuliOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mydialect::MuliOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    if (isConstantInt(op.getRhs(), 1)) {
+      rewriter.replaceOp(op, op.getLhs());
+      return mlir::success();
+    }
+    if (isConstantInt(op.getLhs(), 1)) {
+      rewriter.replaceOp(op, op.getRhs());
+      return mlir::success();
+    }
+    // x * 0 -> 0
+    if (isConstantInt(op.getRhs(), 0) || isConstantInt(op.getLhs(), 0)) {
+      auto zero = mlir::arith::ConstantOp::create(
+          rewriter, op.getLoc(), rewriter.getI32IntegerAttr(0));
+      rewriter.replaceOp(op, zero.getResult());
+      return mlir::success();
+    }
+    return mlir::failure();
+  }
+};
+
+// divi_s: x / 1 -> x
+struct DiviOneCanon : public mlir::OpRewritePattern<mydialect::DivSIOp> {
+  using OpRewritePattern<mydialect::DivSIOp>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mydialect::DivSIOp op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    if (isConstantInt(op.getRhs(), 1)) {
+      rewriter.replaceOp(op, op.getLhs());
+      return mlir::success();
+    }
+    return mlir::failure();
+  }
+};
+
+} // anonymous namespace
+
+namespace mydialect {
+
+void AddI32Op::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
+                                           mlir::MLIRContext *context) {
+  results.add<AddiZeroCanon>(context);
+}
+
+void SubI32Op::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
+                                           mlir::MLIRContext *context) {
+  results.add<SubiZeroCanon>(context);
+}
+
+void MuliOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
+                                         mlir::MLIRContext *context) {
+  results.add<MuliOneCanon>(context);
+}
+
+void DivSIOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
+                                          mlir::MLIRContext *context) {
+  results.add<DiviOneCanon>(context);
 }
 
 struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> {

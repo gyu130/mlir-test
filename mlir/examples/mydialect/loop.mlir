@@ -4,10 +4,8 @@ module {
     %one  = arith.constant 1 : i32
     %ten  = arith.constant 10 : i32
 
-    mydialect.for %zero, %ten, %one : {
-      ^bb0(%i:i32):
+    mydialect.for %i = %zero to %ten step %one : i32 {
       mydialect.print %i : i32
-      mydialect.yield
     }
 
     %ret = arith.constant 0 : i32

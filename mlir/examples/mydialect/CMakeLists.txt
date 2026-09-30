@@ -10,7 +10,7 @@ include(AddLLVM)
 include(AddMLIR)
 include(HandleLLVMOptions)
 
-include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
+#include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
 
 set(LLVM_TARGET_DEFINITIONS mydialect.td)
 mlir_tablegen(mydialect.h.inc -gen-dialect-decls)
@@ -64,6 +64,8 @@ target_link_libraries(mydriver
     MLIRConvertToLLVMPass
     MLIRArithToLLVM
     MLIRFuncToLLVM
+    MLIRSCFToControlFlow
+    MLIRControlFlowToLLVM
     MLIRBuiltinToLLVMIRTranslation
     LLVMX86AsmParser
 )

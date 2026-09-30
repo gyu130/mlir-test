@@ -28,7 +28,7 @@ def AddI32Op : Op<MyDialect, "addi"> {
   let results = (outs I32:$sum);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($sum)";
   let hasFolder = 1;
- // let hasCanonicalizer = 1;
+  let hasCanonicalizer = 1;
 }
 
 def MuliOp : Op<MyDialect, "muli"> {
@@ -38,7 +38,7 @@ def MuliOp : Op<MyDialect, "muli"> {
   let results = (outs I32:$product);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($product)";
   let hasFolder = 1;
- // let hasCanonicalizer = 1;
+  let hasCanonicalizer = 1;
 }
 
 def SubI32Op : Op<MyDialect, "subi"> {
@@ -48,7 +48,7 @@ def SubI32Op : Op<MyDialect, "subi"> {
   let results = (outs I32:$diff);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($diff)";
   let hasFolder = 1;
-//  let hasCanonicalizer = 1;
+  let hasCanonicalizer = 1;
 }
 
 def DivSIOp : Op<MyDialect, "divi_s"> {
@@ -59,7 +59,7 @@ def DivSIOp : Op<MyDialect, "divi_s"> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($quotient)";
   let hasVerifier = 1;
   let hasFolder = 1;
-  //let hasCanonicalizer = 1;
+  let hasCanonicalizer = 1;
 }
 
 // mydialect.cmpi slt, %a, %b : i32  →  i1
@@ -71,22 +71,29 @@ def CmpiOp : Op<MyDialect, "cmpi"> {
 }
 
 def ForOp : Op<MyDialect, "for"> {
-  // 入参：lower, upper, step；迭代变量region参数
-  let arguments = (ins I32:$lower, I32:$upper, I32:$step);
-  let regions = (region SizedRegion<1>:$body);
-  let results = (outs);
+  // 普通循环边界 + 可选 iter_args 初始值
+  let arguments = (ins I32:$lower, I32:$upper, I32:$step,
+                   Variadic<I32>:$iter_args);
 
-  let assemblyFormat = "$lower `,` $upper `,` $step attr-dict `:` $body";
-  //let hasVerifier = 1;
+  let regions = (region SizedRegion<1>:$body);
+  let results = (outs Variadic<I32>:$results);
+
+  // 自定义汇编格式（parse/print 在 MyDialect.cpp 中实现）
+  let hasCustomAssemblyFormat = 1;
+  let hasFolder = 1;
+
+  let extraClassDeclaration = [{
+    mlir::Value getInductionVar();
+    mlir::ValueRange getRegionIterArgs();
+  }];
 }
 
-// mydialect.for 循环体终结符；降低时转换为 scf.yield
+// YieldOp：支持多个返回值，作为ForOp的terminator
 def YieldOp : Op<MyDialect, "yield",
       [Terminator, ParentOneOf<["ForOp"]>]> {
-  let summary = "terminator for mydialect.for body";
-  let arguments = (ins);
+  let arguments = (ins Variadic<I32>:$values);
   let results = (outs);
-  let assemblyFormat = "attr-dict";
+  let assemblyFormat = "(` ` $values^ `:` type($values))? attr-dict";
 }
 
 #endif
