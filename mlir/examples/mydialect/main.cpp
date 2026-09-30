@@ -7,6 +7,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
@@ -23,6 +24,8 @@
 #include "llvm/Support/TargetSelect.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 
 
 extern "C" void my_runtime_print_i32(int32_t val) {
@@ -42,16 +45,20 @@ int main(int argc, char** argv) {
   mlir::arith::registerConvertArithToLLVMInterface(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+  mlir::registerConvertMemRefToLLVMInterface(registry);
+  mlir::ub::registerConvertUBToLLVMInterface(registry);
   mlir::registerLLVMDialectTranslation(registry);
   mlir::registerBuiltinDialectTranslation(registry);
 
   registry.insert<mlir::scf::SCFDialect>();
+  registry.insert<mlir::memref::MemRefDialect>();
 
   mlir::MLIRContext ctx(registry);
   ctx.loadDialect<mydialect::MyDialect>();
   ctx.loadDialect<mlir::func::FuncDialect>();
   ctx.loadDialect<mlir::arith::ArithDialect>();
   ctx.loadDialect<mlir::LLVM::LLVMDialect>();
+  ctx.loadDialect<mlir::memref::MemRefDialect>();
 
 
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(argv[1], &ctx);

@@ -13,6 +13,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -210,6 +211,36 @@ mlir::LogicalResult CmpiOp::verify() {
   bool ok = llvm::is_contained(validPreds, pred);
   if (!ok)
     return emitOpError() << "invalid predicate " << pred;
+  return mlir::success();
+}
+
+// ---- AllocOp verify ----
+mlir::LogicalResult AllocOp::verify() {
+  auto memRefType = mlir::cast<mlir::MemRefType>(getRes().getType());
+  if(memRefType.getRank() != 1)
+    return emitError() << "alloc only support 1-D memref";
+  if(memRefType.getElementType() != mlir::IntegerType::get(getContext(), 32))
+    return emitError() << "alloc only support i32 element";
+  return mlir::success();
+}
+
+// ---- LoadOp verify ----
+mlir::LogicalResult LoadOp::verify() {
+  auto mty = mlir::cast<mlir::MemRefType>(getMemref().getType());
+  if(mty.getRank() != 1)
+    return emitError() << "load only support 1-D memref";
+  if(mty.getElementType() != getRes().getType())
+    return emitError() << "load element type mismatch";
+  return mlir::success();
+}
+
+// ---- StoreOp verify ----
+mlir::LogicalResult StoreOp::verify() {
+  auto mty = mlir::cast<mlir::MemRefType>(getMemref().getType());
+  if(mty.getRank() != 1)
+    return emitError() << "store only support 1-D memref";
+  if(mty.getElementType() != getValue().getType())
+    return emitError() << "store element type mismatch";
   return mlir::success();
 }
 

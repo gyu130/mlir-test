@@ -96,5 +96,39 @@ def YieldOp : Op<MyDialect, "yield",
   let assemblyFormat = "(` ` $values^ `:` type($values))? attr-dict";
 }
 
+//===== 内存操作：alloc / load / store =====
+
+// mydialect.alloc : 栈上分配一维数组
+// 用法：%buf = mydialect.alloc(%size) : memref<?xi32>
+def AllocOp : Op<MyDialect, "alloc"> {
+  let arguments = (ins I32:$size);
+  let results = (outs AnyMemRef:$res);
+
+  let assemblyFormat = "$size attr-dict `:` type($res)";
+  let hasVerifier = 1;
+}
+
+// mydialect.load : 数组读取
+// %val = mydialect.load(%buf, %idx) : i32
+def LoadOp : Op<MyDialect, "load"> {
+  let arguments = (ins AnyMemRef:$memref, I32:$index);
+  let results = (outs I32:$res);
+
+  let assemblyFormat = "$memref `,` $index attr-dict `:` type($memref) `,` type($res)";
+  let hasVerifier = 1;
+}
+
+// mydialect.store : 数组写入
+// mydialect.store %val, %buf, %idx : i32
+def StoreOp : Op<MyDialect, "store"> {
+  let arguments = (ins I32:$value, AnyMemRef:$memref, I32:$index);
+  let results = (outs);
+
+  let assemblyFormat = "$value `,` $memref `,` $index attr-dict `:` type($value) `,` type($memref)";
+  let hasVerifier = 1;
+}
+
+
+
 #endif
 

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -106,7 +107,8 @@ struct LowerMyDialectPrintPass
         mlir::func::FuncDialect,
         mlir::LLVM::LLVMDialect,
         mlir::arith::ArithDialect,
-        mlir::scf::SCFDialect>();
+        mlir::scf::SCFDialect,
+        mlir::memref::MemRefDialect>();
   }
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
@@ -131,11 +133,15 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::CmpiOp>();
     target.addIllegalOp<mydialect::YieldOp>();
     target.addIllegalOp<mydialect::ForOp>();
+    target.addIllegalOp<mydialect::AllocOp>();
+    target.addIllegalOp<mydialect::LoadOp>();
+    target.addIllegalOp<mydialect::StoreOp>();
     // 允许的目标方言
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addLegalDialect<mlir::arith::ArithDialect>();
     target.addLegalDialect<mlir::scf::SCFDialect>();
+    target.addLegalDialect<mlir::memref::MemRefDialect>();
     // --- 3. 注册 patterns ---
     mlir::RewritePatternSet patterns(ctx);
     mydialect::populateMyDialectToLowerPatterns(patterns);
@@ -480,6 +486,57 @@ struct CmpiOpLowering : public mlir::OpConversionPattern<mydialect::CmpiOp> {
   }
 };
 
+struct MyAllocToMemRef : public mlir::OpConversionPattern<mydialect::AllocOp> {
+  using mlir::OpConversionPattern<mydialect::AllocOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::AllocOp op, mydialect::AllocOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto memTy = mlir::cast<mlir::MemRefType>(op.getRes().getType());
+    // memref.alloca 的 size 操作数要求 index 类型，先做 i32→index 转换
+    auto indexSize = rewriter.create<mlir::arith::IndexCastOp>(
+        loc, rewriter.getIndexType(), adaptor.getSize());
+    auto newAlloc = rewriter.create<mlir::memref::AllocaOp>(
+        loc, memTy, mlir::ValueRange{indexSize});
+    rewriter.replaceOp(op, newAlloc.getResult());
+    return mlir::success();
+  }
+};
+
+struct MyLoadToMemRef : public mlir::OpConversionPattern<mydialect::LoadOp> {
+  using mlir::OpConversionPattern<mydialect::LoadOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::LoadOp op, mydialect::LoadOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    // memref.load 的 index 操作数要求 index 类型
+    auto indexVar = rewriter.create<mlir::arith::IndexCastOp>(
+        loc, rewriter.getIndexType(), adaptor.getIndex());
+    auto load = rewriter.create<mlir::memref::LoadOp>(
+        loc, adaptor.getMemref(), mlir::ValueRange{indexVar});
+    rewriter.replaceOp(op, load.getResult());
+    return mlir::success();
+  }
+};
+
+struct MyStoreToMemRef : public mlir::OpConversionPattern<mydialect::StoreOp> {
+  using mlir::OpConversionPattern<mydialect::StoreOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::StoreOp op, mydialect::StoreOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    // memref.store 的 index 操作数要求 index 类型
+    auto indexVar = rewriter.create<mlir::arith::IndexCastOp>(
+        loc, rewriter.getIndexType(), adaptor.getIndex());
+    rewriter.create<mlir::memref::StoreOp>(
+        loc, adaptor.getValue(), adaptor.getMemref(),
+        mlir::ValueRange{indexVar});
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+
 struct ForOpLowering : public mlir::OpConversionPattern<mydialect::ForOp> {
   using mlir::OpConversionPattern<mydialect::ForOp>::OpConversionPattern;
   mlir::LogicalResult matchAndRewrite(mydialect::ForOp op,
@@ -544,13 +601,16 @@ struct ForOpLowering : public mlir::OpConversionPattern<mydialect::ForOp> {
 
 namespace mydialect {
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
-  patterns.add<PrintOpLowering, 
-	AddI32OpLowering, 
-	MuliOpLowering, 
-	SubI32OpLowering, 
-	DivSIOpLowering, 
+  patterns.add<PrintOpLowering,
+	AddI32OpLowering,
+	MuliOpLowering,
+	SubI32OpLowering,
+	DivSIOpLowering,
 	CmpiOpLowering,
-	ForOpLowering>(patterns.getContext());
+	ForOpLowering,
+	MyAllocToMemRef,
+	MyLoadToMemRef,
+	MyStoreToMemRef>(patterns.getContext());
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass() {

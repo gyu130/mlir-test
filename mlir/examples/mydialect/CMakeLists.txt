@@ -35,6 +35,7 @@ target_link_libraries(MyDialectLib
     MLIRSupport
     MLIRFuncDialect
     MLIRArithDialect
+    MLIRMemRefDialect
     MLIRDialect
     MLIRLLVMDialect
     MLIRPass
@@ -55,6 +56,7 @@ target_link_libraries(mydriver
     MLIRSupport
     MLIRFuncDialect
     MLIRArithDialect
+    MLIRMemRefDialect
     MLIRDialect
     MLIRExecutionEngine
     MLIRLLVMDialect
@@ -66,6 +68,8 @@ target_link_libraries(mydriver
     MLIRFuncToLLVM
     MLIRSCFToControlFlow
     MLIRControlFlowToLLVM
+    MLIRMemRefToLLVM
+    MLIRUBToLLVM
     MLIRBuiltinToLLVMIRTranslation
     LLVMX86AsmParser
 )
