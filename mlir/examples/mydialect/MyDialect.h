@@ -23,8 +23,7 @@
 
 namespace mydialect {
 void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns);
-#if 0
-std::unique_ptr<mlir::Pass> createLowerMyDialectPrintPass();
-#endif
+std::unique_ptr<mlir::Pass> createLowerMyDialectPrint();
+void registerMyDialectPasses();
 }
 #endif

@@ -91,67 +91,6 @@ struct DivSIOpLowering : public mlir::OpConversionPattern<mydialect::DivSIOp> {
   }
 };
 
-// ============ Lower Pass ============
-struct LowerMyDialectPrintPass
-    : public mlir::PassWrapper<LowerMyDialectPrintPass, mlir::OperationPass<mlir::ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerMyDialectPrintPass)
-  llvm::StringRef getArgument() const final {
-    return "lower-mydialect-print";
-  }
-  llvm::StringRef getDescription() const final {
-    return "Lower mydialect.print / addi / muli to Arith/LLVM dialect";
-  }
-  void getDependentDialects(mlir::DialectRegistry &registry) const override {
-    registry.insert<
-        mydialect::MyDialect,
-        mlir::func::FuncDialect,
-        mlir::LLVM::LLVMDialect,
-        mlir::arith::ArithDialect,
-        mlir::scf::SCFDialect,
-        mlir::memref::MemRefDialect>();
-  }
-  void runOnOperation() override {
-    mlir::ModuleOp module = getOperation();
-    mlir::MLIRContext *ctx = &getContext();
-    // --- 1. 插入外部 runtime 函数声明 ---
-    mlir::OpBuilder moduleBuilder(module.getBody(), module.getBody()->begin());
-    mlir::Type i32Ty = mlir::IntegerType::get(ctx, 32);
-    mlir::Type voidTy = mlir::LLVM::LLVMVoidType::get(ctx);
-    auto llvmFuncTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty}, false);
-    mlir::LLVM::LLVMFuncOp::create(moduleBuilder,
-        moduleBuilder.getUnknownLoc(),
-        "my_runtime_print_i32",
-        llvmFuncTy,
-        mlir::LLVM::Linkage::External);
-    // --- 2. ConversionTarget：标记 mydialect op 为非法 ---
-    mlir::ConversionTarget target(*ctx);
-    target.addIllegalOp<mydialect::PrintOp>();
-    target.addIllegalOp<mydialect::AddI32Op>();
-    target.addIllegalOp<mydialect::MuliOp>();
-    target.addIllegalOp<mydialect::SubI32Op>();
-    target.addIllegalOp<mydialect::DivSIOp>();
-    target.addIllegalOp<mydialect::CmpiOp>();
-    target.addIllegalOp<mydialect::YieldOp>();
-    target.addIllegalOp<mydialect::ForOp>();
-    target.addIllegalOp<mydialect::AllocOp>();
-    target.addIllegalOp<mydialect::LoadOp>();
-    target.addIllegalOp<mydialect::StoreOp>();
-    // 允许的目标方言
-    target.addLegalDialect<mlir::func::FuncDialect>();
-    target.addLegalDialect<mlir::LLVM::LLVMDialect>();
-    target.addLegalDialect<mlir::arith::ArithDialect>();
-    target.addLegalDialect<mlir::scf::SCFDialect>();
-    target.addLegalDialect<mlir::memref::MemRefDialect>();
-    // --- 3. 注册 patterns ---
-    mlir::RewritePatternSet patterns(ctx);
-    mydialect::populateMyDialectToLowerPatterns(patterns);
-    // --- 4. applyPartialConversion ---
-    if (mlir::failed(mlir::applyPartialConversion(module, target, std::move(patterns)))) {
-      signalPassFailure();
-    }
-  }
-};
-
 // 折叠 mydialect.muli (MuliOp)
 struct FoldMuliPattern : public mlir::RewritePattern {
   FoldMuliPattern(mlir::MLIRContext *ctx)
@@ -613,10 +552,6 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
 	MyStoreToMemRef>(patterns.getContext());
 }
 
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createLowerMyDialectPrintPass() {
-  return std::make_unique<LowerMyDialectPrintPass>();
-}
-
 void registerConstantFoldMyDialectPass() {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return std::make_unique<ConstantFoldMyDialectPass>();
@@ -628,7 +563,6 @@ std::unique_ptr<mlir::Pass> createConstantFoldMyDialectPass() {
 }
 } // namespace mydialect
 
-static mlir::PassRegistration<LowerMyDialectPrintPass> reg;
 static mlir::PassRegistration<ConstantFoldMyDialectPass> regFold;
 
 #include "mlir/IR/DialectRegistry.h"

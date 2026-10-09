@@ -466,6 +466,14 @@ void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns) {
 
 } // namespace mydialect
 
+namespace mydialect {
+#define GEN_PASS_REGISTRATION
+#include "MyDialectPasses.h.inc"
+
+void registerMyDialectPasses() {
+  registerPasses();
+}
+} // namespace mydialect
 
 // 生成各 Op 的方法定义（build/create/verify 等）及 TypeID 定义
 #define GET_OP_CLASSES

@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
   // Pass流水线
   mlir::PassManager optPM(&ctx);
   optPM.addPass(mydialect::createConstantFoldMyDialectPass());
-  optPM.addPass(mydialect::createLowerMyDialectPrintPass());
+  optPM.addPass(mydialect::createLowerMyDialectPrint());
   optPM.addPass(mlir::createCanonicalizerPass());
   // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）
   optPM.addPass(mlir::createSCFToControlFlowPass());
