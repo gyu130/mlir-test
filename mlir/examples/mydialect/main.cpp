@@ -44,6 +44,23 @@ int main(int argc, char** argv) {
     llvm::errs() << "usage: ./mydriver input.mlir\n";
     return 1;
   }
+  
+  // 允许两种调用形式
+  // ./mydriver file.mlir          --> main()
+  // ./mydriver file.mlir  <int>   --> main(i32) -> i32
+  if (argc < 2 || argc >3) {
+    llvm::errs() << "Usage:\n";
+    llvm::errs() << argv[0] << " <mlir-file>          # run main() no args\n";
+    llvm::errs() << argv[0] << " <mlir-file> <intval>  # run main(i32) -> i32\n";
+    return 1;
+  }
+  std::string mlirFilePath = argv[1];
+  std::optional<int> cliArg;
+  if(argc ==3) {
+    cliArg = atoi(argv[2]);
+  }
+
+  
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
   llvm::InitializeNativeTargetAsmParser();
@@ -131,23 +148,53 @@ int main(int argc, char** argv) {
     return symbolMap;
   });
 
-
-
-  // ========== 核心修改：使用 lookup() 查找原生main ==========
-  auto mainSymOrErr = engine->lookup("main");
-  if (!mainSymOrErr) {
-    llvm::errs() << "ERROR: cannot find symbol main\n";
-    llvm::handleAllErrors(mainSymOrErr.takeError(), [](const llvm::ErrorInfoBase &e){
-      llvm::errs() << e.message() << "\n";
-    });
+  // ========= 读取main函数签名（lowering后为 llvm.func）=========
+  auto mainFuncOp = module->lookupSymbol<mlir::LLVM::LLVMFuncOp>("main");
+  if (!mainFuncOp) {
+    llvm::errs() << "Error: cannot find func @main in module\n";
     return 1;
   }
-  void* rawPtr = *mainSymOrErr;
-  using MainFn = int (*)();
-  MainFn mainFunc = reinterpret_cast<MainFn>(rawPtr);
-  int ret = mainFunc();
-  llvm::outs() << "main() return: " << ret << "\n";
+  // 返回类型必须是 i32
+  if (mainFuncOp.getNumResults() != 1 ||
+      !llvm::isa<mlir::IntegerType>(mainFuncOp.getResultTypes()[0])) {
+    llvm::errs() << "Error: func @main must return i32\n";
+    return 1;
+  }
+  // 参数数量校验（只支持 main() 或 main(i32)）
+  unsigned numInputs = mainFuncOp.getNumArguments();
+  if (numInputs == 0 && cliArg.has_value()) {
+    llvm::errs() << "Error: IR main() has NO argument, but you supplied command line argument "
+                 << cliArg.value() << "\n";
+    return 1;
+  }
+  if (numInputs == 1 && !cliArg.has_value()) {
+    llvm::errs() << "Error: IR main(i32) expects one i32 argument, please provide integer in command line\n";
+    return 1;
+  }
+  if (numInputs > 1) {
+    llvm::errs() << "Error: only support main() or main(i32) -> i32, got "
+                 << numInputs << " args\n";
+    return 1;
+  }
 
+  // ========= 根据签名自动构造 invokePacked 参数列表 =========
+  int retVal = 0;
+  int input = cliArg.value_or(0);
+  llvm::SmallVector<void*, 2> invokeArgs;
+  if (numInputs == 1) {
+    // main(i32) -> i32
+    invokeArgs.push_back(&input);
+  }
+  // 无论有无参数，最后一个元素：返回值指针
+  invokeArgs.push_back(&retVal);
+
+  // ========= JIT invoke =========
+  auto invokeRes = engine->invokePacked("main", invokeArgs);
+  if (static_cast<bool>(invokeRes)) {
+    llvm::errs() << "JIT invoke @main failed\n";
+    return 1;
+  }
+  llvm::outs() << "main() return: " << retVal << "\n";
   return 0;
 }
 
