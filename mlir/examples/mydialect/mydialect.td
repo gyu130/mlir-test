@@ -21,6 +21,13 @@ def PrintOp : Op<MyDialect, "print"> {
   let hasVerifier = 1;
 }
 
+def PrintStrOp : Op<MyDialect, "print_str"> {
+  let summary = "print string literal";
+  let arguments = (ins AnyType:$str);
+  let results = (outs);
+  let assemblyFormat = "$str `:` type($str) attr-dict";
+}
+
 def AddI32Op : Op<MyDialect, "addi"> {
   let summary = "i32 add for mydialect";
   let description = "Add two i32 operands";

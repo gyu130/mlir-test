@@ -32,6 +32,13 @@ extern "C" void my_runtime_print_i32(int32_t val) {
 	fprintf(stdout, "[my-runtime-print] value = %d\n", val);
 }
 
+// runtime helper
+extern "C" void my_runtime_print_string(const char* s) {
+  fprintf(stdout, "[my-runtime-print-str] %s\n", s);
+  fflush(stdout);
+}
+
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     llvm::errs() << "usage: ./mydriver input.mlir\n";
@@ -112,6 +119,19 @@ int main(int argc, char** argv) {
     };
     return symbolMap;
   });
+
+
+  engine->registerSymbols([&](llvm::orc::MangleAndInterner interner) {
+    llvm::orc::SymbolMap symbolMap;
+    auto symName = interner("my_runtime_print_string");
+    symbolMap[symName] = {
+        llvm::orc::ExecutorAddr::fromPtr(my_runtime_print_string),
+        llvm::JITSymbolFlags::Exported
+    };
+    return symbolMap;
+  });
+
+
 
   // ========== 核心修改：使用 lookup() 查找原生main ==========
   auto mainSymOrErr = engine->lookup("main");

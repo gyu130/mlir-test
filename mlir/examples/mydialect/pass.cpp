@@ -31,6 +31,21 @@ struct PrintOpLowering : public mlir::OpConversionPattern<mydialect::PrintOp> {
   }
 };
 
+// ============ PrintStrOp: mydialect.print_str → llvm.call @my_runtime_print_string ============
+struct PrintStrOpLowering : public mlir::OpConversionPattern<mydialect::PrintStrOp> {
+  using OpConversionPattern<mydialect::PrintStrOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::PrintStrOp op,
+      typename mydialect::PrintStrOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto sym = mlir::SymbolRefAttr::get(rewriter.getContext(), "my_runtime_print_string");
+    mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, adaptor.getStr());
+    rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
 // ============ AddI32Op: mydialect.addi → arith.addi ============
 struct AddI32OpLowering : public mlir::OpConversionPattern<mydialect::AddI32Op> {
   using OpConversionPattern<mydialect::AddI32Op>::OpConversionPattern;
@@ -541,6 +556,7 @@ struct ForOpLowering : public mlir::OpConversionPattern<mydialect::ForOp> {
 namespace mydialect {
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
   patterns.add<PrintOpLowering,
+	PrintStrOpLowering,
 	AddI32OpLowering,
 	MuliOpLowering,
 	SubI32OpLowering,

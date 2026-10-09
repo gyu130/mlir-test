@@ -49,11 +49,21 @@ struct LowerMyDialectPrintPass
                                      "my_runtime_print_i32",
                                      llvmFuncTy,
                                      mlir::LLVM::Linkage::External);
+      // void my_runtime_print_string(ptr)
+      auto strPtrTy = mlir::LLVM::LLVMPointerType::get(ctx);
+      auto strFuncTy =
+          mlir::LLVM::LLVMFunctionType::get(voidTy, {strPtrTy}, false);
+      mlir::LLVM::LLVMFuncOp::create(moduleBuilder,
+                                     moduleBuilder.getUnknownLoc(),
+                                     "my_runtime_print_string",
+                                     strFuncTy,
+                                     mlir::LLVM::Linkage::External);
     }
 
     // --- 2. ConversionTarget：标记 mydialect op 为非法 ---
     mlir::ConversionTarget target(*ctx);
     target.addIllegalOp<mydialect::PrintOp>();
+    target.addIllegalOp<mydialect::PrintStrOp>();
     target.addIllegalOp<mydialect::AddI32Op>();
     target.addIllegalOp<mydialect::MuliOp>();
     target.addIllegalOp<mydialect::SubI32Op>();
