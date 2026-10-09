@@ -91,6 +91,7 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/MyDialect.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/pass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LowerMyDialectPrint.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/MyOptPass.cpp
   SUPPORT_PLUGINS
   )
 mlir_target_link_libraries(mlir-opt PRIVATE ${LIBS})

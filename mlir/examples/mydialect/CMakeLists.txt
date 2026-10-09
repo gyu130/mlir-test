@@ -24,13 +24,20 @@ set(LLVM_TARGET_DEFINITIONS MyDialectPasses.td)
 mlir_tablegen(MyDialectPasses.h.inc -gen-pass-decls)
 add_public_tablegen_target(MLIRMyDialectPassesIncGen)
 
+
+unset(LLVM_TARGET_DEFINITIONS)
+set(LLVM_TARGET_DEFINITIONS MyOptPass.td)
+mlir_tablegen(MyOptPass.h.inc -gen-pass-decls)
+add_public_tablegen_target(MyOptPassTableGen)
+
 # Dialect库，MyDialect + pass实现
 add_library(MyDialectLib
   MyDialect.cpp
   pass.cpp
   LowerMyDialectPrint.cpp
+  MyOptPass.cpp
 )
-add_dependencies(MyDialectLib MyDialectTableGen MLIRMyDialectPassesIncGen)
+add_dependencies(MyDialectLib MyDialectTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen)
 llvm_process_sources(MyDialectLib PARTIAL_SOURCES_INTENDED)
 target_compile_options(MyDialectLib PRIVATE -fno-rtti)
 

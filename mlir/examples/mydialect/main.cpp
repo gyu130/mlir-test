@@ -1,5 +1,6 @@
 #include "MyDialect.h"
 #include "pass.h"
+#include "MyOptPass.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
 
   // Pass流水线
   mlir::PassManager optPM(&ctx);
+  optPM.addPass(mydialect::createMyOptPass()); // 高层优化Pass
   optPM.addPass(mydialect::createConstantFoldMyDialectPass());
   optPM.addPass(mydialect::createLowerMyDialectPrint());
   optPM.addPass(mlir::createCanonicalizerPass());
