@@ -3,94 +3,111 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"  // 新增：贪婪重写驱动
 #include "MyDialect.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-
+using namespace mlir;
 namespace mydialect {
 
-// 生成 impl::MyOptPassBase（getArgument="my-opt"、getDescription、
-// createMyOptPass 由 friend 自动提供）以及 registerMyOptPass()
+// 保留原有 TableGen 生成逻辑（Base模板、注册宏）
 #define GEN_PASS_DEF_MYOPTPASS
 #include "MyOptPass.h.inc"
-
 #define GEN_PASS_REGISTRATION_MYOPTPASS
 #include "MyOptPass.h.inc"
 
 namespace {
 
+// ==============================
+// Pattern 1：删除连续冗余 mydialect.print
+// 规则：如果当前 print 的前一个 op 也是 print，且操作数完全相同，删除当前 print
+// ==============================
+struct RemoveRedundantPrintPattern : public OpRewritePattern<PrintOp> {
+  using OpRewritePattern<PrintOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(PrintOp printOp,
+                                PatternRewriter &rewriter) const override {
+    Block *block = printOp->getBlock();
+    auto opIt = printOp->getIterator();
+    // 块开头没有前一个op，直接不匹配
+    if (opIt == block->begin())
+      return failure();
+
+    // 往前看一个op
+    --opIt;
+    Operation *prevOp = &*opIt;
+    auto prevPrint = dyn_cast<PrintOp>(prevOp);
+    if (!prevPrint)
+      return failure();
+
+    // 前一个print和当前print打印同一个值，删除当前冗余打印
+    if (prevPrint.getValue() == printOp.getValue()) {
+      rewriter.eraseOp(printOp);
+      return success();
+    }
+    return failure();
+  }
+};
+
+// ==============================
+// Pattern 2：块内 arith.addi 公共子表达式消除（CSE）
+// 规则：如果当前 addi 之前已经有完全相同(lhs,rhs)的addi，复用之前的结果，删除当前addi
+// ==============================
+struct AddiCSEPattern : public OpRewritePattern<arith::AddIOp> {
+  using OpRewritePattern<arith::AddIOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::AddIOp addOp,
+                                PatternRewriter &rewriter) const override {
+    Value lhs = addOp.getLhs();
+    Value rhs = addOp.getRhs();
+    Block *block = addOp->getBlock();
+    auto opIt = addOp->getIterator();
+
+    // 向前遍历当前块中所有在 addOp 之前的op
+    for (auto it = opIt; it != block->begin();) {
+      --it;
+      Operation *prevOp = &*it;
+      auto prevAdd = dyn_cast<arith::AddIOp>(prevOp);
+      if (!prevAdd)
+        continue;
+      // 找到相同操作数的addi，替换当前结果为之前addi的结果
+      if (prevAdd.getLhs() == lhs && prevAdd.getRhs() == rhs) {
+        rewriter.replaceOp(addOp, prevAdd.getResult());
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+// ==============================
+// 主Pass：继承TableGen生成的Base，内部用Pattern驱动优化
+// ==============================
 struct MyOptPass : public impl::MyOptPassBase<MyOptPass> {
   void runOnOperation() override;
 };
 
-// 文件级自动注册：PassRegistration 构造时把 pass 登记进全局 PassRegistry，
-// 链接本文件的二进制（mydriver / mlir-opt）自动获得 --my-opt 选项。
-// 必须与 struct 同在 anonymous namespace 内，否则全局作用域看不到该类型。
+// 保留原有自动注册逻辑
 static mlir::PassRegistration<MyOptPass> reg;
 
-} // namespace
+} // anonymous namespace
 
 void MyOptPass::runOnOperation() {
-  mlir::ModuleOp module = getOperation();
-  // 遍历 module 内所有 func.func
-  module.walk([&](mlir::func::FuncOp func) {
-    // ========== 优化1：删除连续重复 mydialect.print ==========
-    // 扫描块内操作，连续相同 operand 的 print，只保留第一条
-    for (mlir::Block &block : func.getBlocks()) {
-      llvm::SmallVector<mlir::Operation *, 8> toErase;
-      mlir::Operation *lastPrint = nullptr;
-      mlir::Value lastPrintVal;
+  ModuleOp module = getOperation();
+  MLIRContext *ctx = &getContext();
 
-      for (mlir::Operation &op : block) {
-        if (auto printOp = mlir::dyn_cast<mydialect::PrintOp>(&op)) {
-          mlir::Value val = printOp.getValue();
-          if (lastPrint && lastPrintVal == val) {
-            // 和上一条 print 完全一样，标记删除
-            toErase.push_back(&op);
-          } else {
-            lastPrint = &op;
-            lastPrintVal = val;
-          }
-          continue;
-        }
-        // 遇到非 print 操作，打断连续 print 序列
-        lastPrint = nullptr;
-        lastPrintVal = nullptr;
-      }
-      for (mlir::Operation *op : toErase) op->erase();
-    }
+  // 1. 构建Pattern集合：所有优化规则在这里add，新增优化只需要新增Pattern类即可
+  RewritePatternSet patterns(ctx);
+  patterns.add<RemoveRedundantPrintPattern, AddiCSEPattern>(ctx);
 
-    // ========== 优化2：简单 CSE：块内相同的 arith.addi ==========
-    // 同一 Block 内操作数完全相同的 addi，复用首次结果
-    for (mlir::Block &block : func.getBlocks()) {
-      llvm::DenseMap<std::pair<mlir::Value, mlir::Value>, mlir::Value> addMap;
-      llvm::SmallVector<mlir::Operation *, 8> toErase;
-      for (mlir::Operation &op : block) {
-        auto addOp = mlir::dyn_cast<mlir::arith::AddIOp>(&op);
-        if (!addOp)
-          continue;
-        auto key = std::make_pair(addOp.getLhs(), addOp.getRhs());
-        auto it = addMap.find(key);
-        if (it != addMap.end()) {
-          // 已有相同 addi，所有使用替换成旧结果，删除当前 add
-          addOp.getResult().replaceAllUsesWith(it->second);
-          toErase.push_back(&op);
-        } else {
-          addMap[key] = addOp.getResult();
-        }
-      }
-      for (mlir::Operation *op : toErase) op->erase();
-    }
-  });
+  // 2. 贪婪重写：自动迭代直到没有Pattern可以匹配，自动处理use-def安全替换/删除
+  GreedyRewriteConfig config;
+  config.setMaxIterations(10);  // 防止死循环
+  config.setUseTopDownTraversal(true);
+
+  if (failed(applyPatternsGreedily(module, std::move(patterns), config))) {
+    signalPassFailure();
+  }
 }
 
 } // namespace mydialect
-#if 0
-// 文件级自动注册：链接本文件的二进制（mydriver / mlir-opt）
-// 无需显式调用即可获得 --my-opt 命令行选项
-static bool _myOptPassAutoRegistered = []() {
-  mydialect::registerMyOptPass();
-  return true;
-}();
-#endif
 
