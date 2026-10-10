@@ -554,7 +554,8 @@ struct ForOpLowering : public mlir::OpConversionPattern<mydialect::ForOp> {
 } // anonymous namespace
 
 namespace mydialect {
-void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
+void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
+                                      mlir::TypeConverter &converter) {
   patterns.add<PrintOpLowering,
 	PrintStrOpLowering,
 	AddI32OpLowering,
@@ -565,7 +566,7 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns) {
 	ForOpLowering,
 	MyAllocToMemRef,
 	MyLoadToMemRef,
-	MyStoreToMemRef>(patterns.getContext());
+	MyStoreToMemRef>(converter, patterns.getContext());
 }
 
 void registerConstantFoldMyDialectPass() {

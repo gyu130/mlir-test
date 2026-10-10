@@ -5,7 +5,7 @@
 #include "mydialect.cpp.inc"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/AsmParser/AsmParser.h"
-
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -20,23 +20,31 @@
 namespace {
 
 struct PrintOpLowering : public mlir::OpRewritePattern<mydialect::PrintOp> {
-  using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;
+  // 构造函数接收TypeConverter
+  PrintOpLowering(mlir::TypeConverter *converter, mlir::MLIRContext *ctx)
+      : OpRewritePattern<mydialect::PrintOp>(ctx), converter(converter) {}
 
   mlir::LogicalResult matchAndRewrite(mydialect::PrintOp printOp,
                                       mlir::PatternRewriter &rewriter) const override {
-  auto i32Ty = rewriter.getI32Type();
-  // ✅ 修复：使用 LLVMVoidType，不是 getNoneType()
-  auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
-  auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
+    mlir::Value inputVal = printOp.getOperand();
+    // ===== 使用TypeConverter做类型转换 =====
+    mlir::Type convertedInputTy = converter->convertType(inputVal.getType());
+    if (!convertedInputTy) {
+      return mlir::failure();
+    }
 
-  auto funcSym = mlir::SymbolRefAttr::get(printOp.getContext(), "my_runtime_print_i32");
-  mlir::LLVM::CallOp::create(rewriter, printOp.getLoc(), funcTy, funcSym, printOp.getOperand());
-  rewriter.eraseOp(printOp);
-  return mlir::success();
-
-
+    auto i32Ty = rewriter.getI32Type();
+    auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
+    auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
+    auto funcSym = mlir::SymbolRefAttr::get(printOp.getContext(), "my_runtime_print_i32");
+    mlir::LLVM::CallOp::create(rewriter, printOp.getLoc(), funcTy, funcSym, inputVal);
+    rewriter.eraseOp(printOp);
+    return mlir::success();
   }
+private:
+  mlir::TypeConverter *converter;
 };
+
 } // anonymous namespace
 
 
@@ -437,31 +445,6 @@ void MuliOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
 void DivSIOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
                                           mlir::MLIRContext *context) {
   results.add<DiviOneCanon>(context);
-}
-
-struct PrintOpToLLVMRewrite : public mlir::OpRewritePattern<mydialect::PrintOp> {
-  using OpRewritePattern<mydialect::PrintOp>::OpRewritePattern;
-
-  mlir::LogicalResult matchAndRewrite(mydialect::PrintOp op,
-                                      mlir::PatternRewriter &rewriter) const override {
-    // 构造LLVM函数类型 void(i32)
-    auto i32Ty = rewriter.getI32Type();
-    auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
-    auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
-
-    // 获取符号，对应我们宿主 extern "C" my_runtime_print_i32
-    auto func = mlir::SymbolRefAttr::get(op.getContext(), "my_runtime_print_i32");
-    mlir::LLVM::CallOp::create(rewriter, op.getLoc(), funcTy, func, op.getOperand());
-    rewriter.eraseOp(op);
-    return mlir::success();
-  }
-};
-
-
-// 对外暴露，mydriver里面可以调用这个pattern集合
-void populatePrintOpToLLVMPatterns(mlir::RewritePatternSet &patterns) {
-  patterns.add<PrintOpToLLVMRewrite>(patterns.getContext());
-  //patterns.add<PrintOpLowering>(patterns.getContext());
 }
 
 } // namespace mydialect
