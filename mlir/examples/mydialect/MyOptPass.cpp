@@ -23,6 +23,11 @@ struct MyOptPass : public impl::MyOptPassBase<MyOptPass> {
   void runOnOperation() override;
 };
 
+// 文件级自动注册：PassRegistration 构造时把 pass 登记进全局 PassRegistry，
+// 链接本文件的二进制（mydriver / mlir-opt）自动获得 --my-opt 选项。
+// 必须与 struct 同在 anonymous namespace 内，否则全局作用域看不到该类型。
+static mlir::PassRegistration<MyOptPass> reg;
+
 } // namespace
 
 void MyOptPass::runOnOperation() {
@@ -80,10 +85,12 @@ void MyOptPass::runOnOperation() {
 }
 
 } // namespace mydialect
-
+#if 0
 // 文件级自动注册：链接本文件的二进制（mydriver / mlir-opt）
 // 无需显式调用即可获得 --my-opt 命令行选项
 static bool _myOptPassAutoRegistered = []() {
   mydialect::registerMyOptPass();
   return true;
 }();
+#endif
+
