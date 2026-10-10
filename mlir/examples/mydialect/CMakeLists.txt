@@ -88,3 +88,8 @@ target_link_libraries(mydriver
     LLVMX86AsmParser
 )
 
+if (MLIR_INCLUDE_TESTS)
+  add_subdirectory(test)
+endif()
+
+

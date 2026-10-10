@@ -1,0 +1,3 @@
+6.639743e-02 lowering/print_lowering.mlir
+5.873704e-02 myopt/addi_cse.mlir
+7.261729e-02 myopt/redundant_print.mlir
