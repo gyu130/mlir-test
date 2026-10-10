@@ -17,6 +17,8 @@ mlir_tablegen(mydialect.h.inc -gen-dialect-decls)
 mlir_tablegen(mydialect.cpp.inc -gen-dialect-defs)
 mlir_tablegen(mydialect-opdefs.h.inc -gen-op-decls)
 mlir_tablegen(mydialect-opdefs.cpp.inc -gen-op-defs)
+mlir_tablegen(mydialect.typedefs.h.inc -gen-typedef-decls)
+mlir_tablegen(mydialect.typedefs.cpp.inc -gen-typedef-defs)
 add_public_tablegen_target(MyDialectTableGen)
 
 unset(LLVM_TARGET_DEFINITIONS)

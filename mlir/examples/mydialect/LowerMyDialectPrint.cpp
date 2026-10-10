@@ -19,17 +19,33 @@ namespace mydialect {
 //  memref→LLVM 由后续 --convert-to-llvm pass 用它自己的 converter 完成）。
 struct MyDialectTypeConverter : public mlir::TypeConverter {
   MyDialectTypeConverter() {
-    // 自定义类型转换规则写在这里（addConversion 后注册的规则优先匹配）：
-    //
-    // 示例：将来给 mydialect 增加自定义类型 !mydialect.wrapped_i32 后，
-    // addConversion([](mydialect::WrappedI32Type) -> mlir::Type {
-    //   return mlir::IntegerType::get(..., 32);  // 降级成 i32
-    // });
-
     // 兜底：其余类型（i32/index/memref/...）保持原样。
     // 裸 TypeConverter 没有任何规则时 convertType 对所有类型都失败、
     // isLegal 恒为 false，所以 identity 兜底必须存在。
+    // 注意：addConversion 是 LIFO——后注册的先尝试，
+    // 因此 identity 兜底必须先注册，具体规则后注册才生效。
     addConversion([](mlir::Type ty) { return ty; });
+
+    // wrapped_i32 降级为普通 i32（之后 i32 走正常 arith/llvm 链路）
+    addConversion([](mydialect::WrappedI32Type type) -> mlir::Type {
+      return mlir::IntegerType::get(type.getContext(), 32);
+    });
+
+    // wrapped_i32 ↔ i32 materialization：用 unrealized_conversion_cast 占位
+    addSourceMaterialization(
+        [](mlir::OpBuilder &builder, mlir::Type resultType,
+           mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
+          if (inputs.size() != 1) return nullptr;
+          return builder.create<mlir::UnrealizedConversionCastOp>(
+              loc, resultType, inputs[0]).getResult(0);
+        });
+    addTargetMaterialization(
+        [](mlir::OpBuilder &builder, mlir::Type resultType,
+           mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
+          if (inputs.size() != 1) return nullptr;
+          return builder.create<mlir::UnrealizedConversionCastOp>(
+              loc, resultType, inputs[0]).getResult(0);
+        });
   }
 };
 
@@ -85,6 +101,8 @@ struct LowerMyDialectPrintPass
     // --- 2. ConversionTarget：标记 mydialect op 为非法 ---
     mlir::ConversionTarget target(*ctx);
     target.addIllegalOp<mydialect::PrintOp>();
+    target.addIllegalOp<mydialect::WrapOp>();
+    target.addIllegalOp<mydialect::UnwrapOp>();
     target.addIllegalOp<mydialect::PrintStrOp>();
     target.addIllegalOp<mydialect::AddI32Op>();
     target.addIllegalOp<mydialect::MuliOp>();
@@ -101,6 +119,10 @@ struct LowerMyDialectPrintPass
     target.addLegalDialect<mlir::arith::ArithDialect>();
     target.addLegalDialect<mlir::scf::SCFDialect>();
     target.addLegalDialect<mlir::memref::MemRefDialect>();
+    // pattern 内手工插入的 unrealized_conversion_cast（wrapped_i32→i32 擦除）
+    // 会作为普通新 op 做合法性检查，必须显式标记合法；
+    // 转换结束时驱动会自动折叠掉已解耦的 cast。
+    target.addLegalOp<mlir::UnrealizedConversionCastOp>();
 
     // 说明：MLIR 22 的 ConversionTarget 没有 addDynamicallyLegalType。
     // 类型合法性由绑定在 OpConversionPattern 上的 TypeConverter 驱动：
@@ -124,8 +146,11 @@ struct LowerMyDialectPrintPass
     }
   }
 };
+} // namespace
 
-} // namespace mydialect
+// ========= 类型转换说明 =========
+// UnwrapOp/WrapOp 已在 TD 中定义，供后续扩展；
+// 当前 test 用例中 print 直接接受 wrapped_i32，由 MyDialectTypeConverter 转 i32。
 
 namespace mydialect {
 // 引入注册函数声明（inline，可多 TU 安全）

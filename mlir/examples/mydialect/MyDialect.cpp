@@ -1,8 +1,15 @@
 #include "MyDialect.h"
+#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/IR/DialectImplementation.h"
 
 // TableGen 生成的 Dialect 定义：构造函数、析构函数、TypeID 定义。
 // 构造函数内会调用 initialize()。
+// TableGen 生成的自定义类型定义（WrappedI32Type）
+// 放在 Dialect 定义 .inc 之前，让类型存储器/接口可后于 op 定义链接
 #include "mydialect.cpp.inc"
+#include "mydialect.typedefs.h.inc"
+#define GET_TYPEDEF_CLASSES
+#include "mydialect.typedefs.cpp.inc"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
@@ -17,45 +24,41 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 
-namespace {
-
-struct PrintOpLowering : public mlir::OpRewritePattern<mydialect::PrintOp> {
-  // 构造函数接收TypeConverter
-  PrintOpLowering(mlir::TypeConverter *converter, mlir::MLIRContext *ctx)
-      : OpRewritePattern<mydialect::PrintOp>(ctx), converter(converter) {}
-
-  mlir::LogicalResult matchAndRewrite(mydialect::PrintOp printOp,
-                                      mlir::PatternRewriter &rewriter) const override {
-    mlir::Value inputVal = printOp.getOperand();
-    // ===== 使用TypeConverter做类型转换 =====
-    mlir::Type convertedInputTy = converter->convertType(inputVal.getType());
-    if (!convertedInputTy) {
-      return mlir::failure();
-    }
-
-    auto i32Ty = rewriter.getI32Type();
-    auto voidTy = mlir::LLVM::LLVMVoidType::get(rewriter.getContext());
-    auto funcTy = mlir::LLVM::LLVMFunctionType::get(voidTy, {i32Ty});
-    auto funcSym = mlir::SymbolRefAttr::get(printOp.getContext(), "my_runtime_print_i32");
-    mlir::LLVM::CallOp::create(rewriter, printOp.getLoc(), funcTy, funcSym, inputVal);
-    rewriter.eraseOp(printOp);
-    return mlir::success();
-  }
-private:
-  mlir::TypeConverter *converter;
-};
-
-} // anonymous namespace
-
-
 namespace mydialect {
 
-// 注册 TableGen 生成的所有 Op（PrintOp 等）
+// 注册 TableGen 生成的所有 Op 和自定义类型
 void MyDialect::initialize() {
   addOperations<
 #define GET_OP_LIST
 #include "mydialect-opdefs.cpp.inc"
       >();
+  // WrappedI32Type：TableGen 生成 WrappedI32Type 类与 generatedTypeParser/
+  // generatedTypePrinter 静态函数（见 mydialect.typedefs.cpp.inc），
+  // parseType/printType 中调用它们。
+  addTypes<
+#define GET_TYPEDEF_LIST
+#include "mydialect.typedefs.cpp.inc"
+      >();
+}
+
+// 类型解析：mydialect.wrapped_i32
+mlir::Type MyDialect::parseType(mlir::DialectAsmParser &parser) const {
+  llvm::StringRef keyword;
+  if (parser.parseKeyword(&keyword))
+    return nullptr;
+  if (keyword == "wrapped_i32")
+    return WrappedI32Type::get(parser.getContext());
+  parser.emitError(parser.getNameLoc(), "unknown mydialect type: ") << keyword;
+  return nullptr;
+}
+
+// 类型打印：直接输出 wrapped_i32
+void MyDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const {
+  if (mlir::isa<WrappedI32Type>(type)) {
+    printer << "wrapped_i32";
+    return;
+  }
+  llvm_unreachable("unknown type in mydialect printType");
 }
 
 // -------- custom assembly for PrintOp --------
@@ -185,19 +188,6 @@ mlir::ParseResult ForOp::parse(mlir::OpAsmParser &parser,
     return mlir::failure();
 
   return mlir::success();
-}
-
-mlir::LogicalResult PrintOp::verify() {
-	    mlir::Type opTy = getOperand().getType();
-	    //auto intTy = dyn_cast<mlir::InterType>();
-	    if (!opTy.isInteger()){
-	        return emitOpError() << "operand must be integer type, but got " << opTy;         
-	    }
-	    if (opTy.getIntOrFloatBitWidth() != 32) {
-        	return emitOpError() << "operand must be i32, got " << opTy;
-    	    }
-
-	    return mlir::success();
 }
 
 // divi_s verifier

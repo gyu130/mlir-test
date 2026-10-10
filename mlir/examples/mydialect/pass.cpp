@@ -16,6 +16,38 @@
 #include "llvm/ADT/DenseMap.h"
 
 namespace {
+// ============ WrapOp: mydialect.wrap i32→wrapped_i32，降级时透传 ============
+// wrapped_i32 经 TypeConverter 转 i32，wrap 语义上就是 identity，直接替换
+struct WrapOpLowering : public mlir::OpConversionPattern<mydialect::WrapOp> {
+  using OpConversionPattern<mydialect::WrapOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::WrapOp op,
+      typename mydialect::WrapOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    // 结果类型经 converter 为 i32，adaptor.getInput() 也是 i32，直接透传
+    rewriter.replaceOp(op, adaptor.getInput());
+    return mlir::success();
+  }
+};
+
+// ============ UnwrapOp: mydialect.unwrap wrapped_i32→i32，降级时透传 ============
+struct UnwrapOpLowering : public mlir::OpConversionPattern<mydialect::UnwrapOp> {
+  using OpConversionPattern<mydialect::UnwrapOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::UnwrapOp op,
+      typename mydialect::UnwrapOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::Value input = adaptor.getInput();
+    // 输入可能仍是 wrapped_i32，显式擦除为 i32 后透传
+    if (mlir::isa<mydialect::WrappedI32Type>(input.getType())) {
+      input = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          op.getLoc(), rewriter.getI32Type(), input).getResult(0);
+    }
+    rewriter.replaceOp(op, input);
+    return mlir::success();
+  }
+};
+
 // ============ PrintOp: mydialect.print → llvm.call ============
 struct PrintOpLowering : public mlir::OpConversionPattern<mydialect::PrintOp> {
   using OpConversionPattern<mydialect::PrintOp>::OpConversionPattern;
@@ -25,7 +57,15 @@ struct PrintOpLowering : public mlir::OpConversionPattern<mydialect::PrintOp> {
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto sym = mlir::SymbolRefAttr::get(rewriter.getContext(), "my_runtime_print_i32");
-    mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, adaptor.getValue());
+    mlir::Value val = adaptor.getValue();
+    // 上游 wrap 可能尚未转换，此时 val 仍是 wrapped_i32；
+    // 显式插入 unrealized_conversion_cast 擦除为 i32，
+    // 待 wrap 转换（identity 透传）后该 cast 会被驱动自动折叠掉。
+    if (mlir::isa<mydialect::WrappedI32Type>(val.getType())) {
+      val = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          loc, rewriter.getI32Type(), val).getResult(0);
+    }
+    mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, val);
     rewriter.eraseOp(op);
     return mlir::success();
   }
@@ -556,7 +596,9 @@ struct ForOpLowering : public mlir::OpConversionPattern<mydialect::ForOp> {
 namespace mydialect {
 void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
                                       mlir::TypeConverter &converter) {
-  patterns.add<PrintOpLowering,
+  patterns.add<WrapOpLowering,
+	UnwrapOpLowering,
+	PrintOpLowering,
 	PrintStrOpLowering,
 	AddI32OpLowering,
 	MuliOpLowering,

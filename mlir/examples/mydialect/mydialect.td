@@ -8,17 +8,48 @@ def MyDialect : Dialect {
   let summary = "A minimal custom MLIR dialect example";
   let description = "Minimal demo dialect with print op";
   let cppNamespace = "::mydialect";
+  // 声明自定义类型的 parse/print 钩子（C++ 实现中 override）
+  let extraClassDeclaration = [{
+    /// 解析/打印自定义类型（wrapped_i32）
+    ::mlir::Type parseType(::mlir::DialectAsmParser &parser) const override;
+    void printType(::mlir::Type type, ::mlir::DialectAsmPrinter &printer) const override;
+  }];
 }
+
+// ========== 自定义类型 WrappedI32Type：包装一个 i32 ==========
+// TypeDef 让 TableGen 生成 WrappedI32Type C++ 类（经 -gen-typedef-defs）
+// 注意：TD 定义后仍需在 Dialect::initialize() addTypes<...> 注册，
+// 并手写 parseType/printType 支持汇编中的 mydialect.wrapped_i32
+def WrappedI32Type : TypeDef<MyDialect, "WrappedI32"> {
+  let mnemonic = "wrapped_i32";        // 汇编中显示为 mydialect.wrapped_i32
+}
+
+// unwrap 算子：mydialect.unwrap : wrapped_i32 -> i32（显式去包装，供测试用）
+def UnwrapOp : Op<MyDialect, "unwrap"> {
+  let summary = "Unwrap wrapped_i32 to raw i32";
+  let arguments = (ins AnyType:$input);
+  let results = (outs I32:$out);
+  let assemblyFormat = "$input attr-dict `:` type($input) `,` type($out)";
+}
+
+// wrap 算子：mydialect.wrap : i32 -> wrapped_i32（显式包装，供测试用）
+def WrapOp : Op<MyDialect, "wrap"> {
+  let summary = "Wrap i32 into wrapped_i32";
+  let arguments = (ins I32:$input);
+  let results = (outs AnyType:$out);
+  let assemblyFormat = "$input attr-dict `:` type($input) `,` type($out)";
+}
+
+// 【类型约束】用于 Op 定义中类型检查
+def WrappedI32TypeConstraint : Type<CPred<"$_self.isa<::mydialect::WrappedI32Type>()">, "wrapped_i32 type">;
 
 def PrintOp : Op<MyDialect, "print"> {
   let summary = "Print integer value op";
   let description = "Print an integer value to stdout";
-  let arguments = (ins I32:$value);
+  let arguments = (ins AnyType:$value);
   let results = (outs);
 
-  let hasCustomAssemblyFormat = 1;  
-
-  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
 }
 
 def PrintStrOp : Op<MyDialect, "print_str"> {
