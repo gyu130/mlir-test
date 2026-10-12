@@ -51,50 +51,63 @@ mlir::Type MyDialect::parseType(mlir::DialectAsmParser &parser) const {
     return WrappedI32Type::get(parser.getContext());
   }
 
-  // 格式：tensor<[d0,d1,...], elemTy>，shape 允许空 []
+  // 格式：tensor<[d0,d1,...], elemTy>，mnemonic "tensor" 已消费，
+  // 余下 <...> 部分由 MyTensorType::parse 解析（hasCustomAssemblyFormat=1）
   if (keyword == "tensor") {
-    mlir::SmallVector<int64_t, 4> dims;
-    if (parser.parseLess() || parser.parseLSquare())
-      return nullptr;
-
-    // parseOptionalRSquare：']' 存在并消费时返回 success（见 AsmParserImpl.h）
-    if (failed(parser.parseOptionalRSquare())) {
-      do {
-        int64_t v;
-        if (parser.parseInteger(v))
-          return nullptr;
-        dims.push_back(v);
-      } while (succeeded(parser.parseOptionalComma()));
-      if (parser.parseRSquare())
-        return nullptr;
-    }
-
-    mlir::Type elemTy;
-    if (parser.parseComma() || parser.parseType(elemTy) ||
-        parser.parseGreater())
-      return nullptr;
-
-    mlir::Builder b(parser.getContext());
-    mlir::ArrayAttr shapeAttr = b.getI64ArrayAttr(dims);
-    return mydialect::MyTensorType::get(parser.getContext(), shapeAttr, elemTy);
+    return MyTensorType::parse(parser);
   }
 
   parser.emitError(parser.getNameLoc(), "unknown mydialect type: ") << keyword;
   return nullptr;
 }
 
+// ---- MyTensorType 自定义汇编：parse/print 处理 <[dims], elemTy> ----
+// mnemonic "tensor" 由框架（parseCustomTypeWithFallback）消费后调用 parse
+mlir::Type mydialect::MyTensorType::parse(mlir::AsmParser &parser) {
+  mlir::SmallVector<int64_t, 4> dims;
+  if (parser.parseLess() || parser.parseLSquare())
+    return nullptr;
+
+  // parseOptionalRSquare：']' 存在并消费时返回 success（见 AsmParserImpl.h）
+  if (failed(parser.parseOptionalRSquare())) {
+    do {
+      int64_t v;
+      if (parser.parseInteger(v))
+        return nullptr;
+      dims.push_back(v);
+    } while (succeeded(parser.parseOptionalComma()));
+    if (parser.parseRSquare())
+      return nullptr;
+  }
+
+  mlir::Type elemTy;
+  if (parser.parseComma() || parser.parseType(elemTy) ||
+      parser.parseGreater())
+    return nullptr;
+
+  mlir::Builder b(parser.getContext());
+  mlir::ArrayAttr shapeAttr = b.getI64ArrayAttr(dims);
+  return MyTensorType::get(parser.getContext(), shapeAttr, elemTy);
+}
+
+void mydialect::MyTensorType::print(mlir::AsmPrinter &printer) const {
+  // stripped 格式（含 mnemonic，不含 !mydialect. 前缀）：
+  // printStrippedAttrOrType 调用本方法，OpAsmPrinter 的 type($x) 据此输出
+  printer << "tensor<[";
+  auto shapeAttr = getShape();
+  for (size_t i = 0; i < shapeAttr.size(); i++) {
+    if (i > 0) printer << ",";
+    auto intAttr = mlir::cast<mlir::IntegerAttr>(shapeAttr[i]);
+    printer << intAttr.getInt();
+  }
+  printer << "], " << getElementType() << ">";
+}
+
 void MyDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const {
   if (auto wrappedTy = mlir::dyn_cast<mydialect::WrappedI32Type>(type)) {
     printer << "wrapped_i32";
   } else if (auto tensorTy = mlir::dyn_cast<mydialect::MyTensorType>(type)) {
-    printer << "tensor<[";
-    auto shapeAttr = tensorTy.getShape();
-    for (size_t i = 0; i < shapeAttr.size(); i++) {
-      if (i > 0) printer << ",";
-      auto intAttr = mlir::cast<mlir::IntegerAttr>(shapeAttr[i]);
-      printer << intAttr.getInt();
-    }
-    printer << "], " << tensorTy.getElementType() << ">";
+    tensorTy.print(printer);
   } else {
     llvm_unreachable("unhandled mydialect type");
   }
@@ -280,6 +293,40 @@ mlir::LogicalResult StoreOp::verify() {
     return emitError() << "store only support 1-D memref";
   if(mty.getElementType() != getValue().getType())
     return emitError() << "store element type mismatch";
+  return mlir::success();
+}
+
+// ====== 张量逐元素 op verify：shape/元素类型一致性，cmpi 结果须为 i1 ======
+mlir::LogicalResult AddTensorOp::verify() {
+  auto lhsTy = mlir::cast<mydialect::MyTensorType>(getLhs().getType());
+  auto rhsTy = mlir::cast<mydialect::MyTensorType>(getRhs().getType());
+  if (lhsTy.getShape() != rhsTy.getShape())
+    return emitOpError() << "add_tensor: shape mismatch";
+  if (lhsTy.getElementType() != rhsTy.getElementType())
+    return emitOpError() << "add_tensor: element type mismatch";
+  return mlir::success();
+}
+
+mlir::LogicalResult MulTensorOp::verify() {
+  auto lhsTy = mlir::cast<mydialect::MyTensorType>(getLhs().getType());
+  auto rhsTy = mlir::cast<mydialect::MyTensorType>(getRhs().getType());
+  if (lhsTy.getShape() != rhsTy.getShape())
+    return emitOpError() << "mul_tensor: shape mismatch";
+  if (lhsTy.getElementType() != rhsTy.getElementType())
+    return emitOpError() << "mul_tensor: element type mismatch";
+  return mlir::success();
+}
+
+mlir::LogicalResult CmpITensorOp::verify() {
+  auto lhsTy = mlir::cast<mydialect::MyTensorType>(getLhs().getType());
+  auto rhsTy = mlir::cast<mydialect::MyTensorType>(getRhs().getType());
+  if (lhsTy.getShape() != rhsTy.getShape())
+    return emitOpError() << "cmpi_tensor: shape mismatch";
+  if (lhsTy.getElementType() != rhsTy.getElementType())
+    return emitOpError() << "cmpi_tensor: element type mismatch";
+  auto resTy = mlir::cast<mydialect::MyTensorType>(getRes().getType());
+  if (resTy.getElementType() != mlir::IntegerType::get(getContext(), 1))
+    return emitOpError() << "cmpi_tensor: result element must be i1";
   return mlir::success();
 }
 

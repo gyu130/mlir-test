@@ -9,6 +9,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 
 
 // TableGen 生成的 Dialect 声明（class MyDialect 等）

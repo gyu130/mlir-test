@@ -1,5 +1,6 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -148,6 +149,11 @@ struct LowerMyDialectPrintPass
     target.addDynamicallyLegalOp<mlir::func::FuncOp>([&](mlir::func::FuncOp op) {
       return typeConverter.isSignatureLegal(op.getFunctionType());
     });
+    // func.return 操作数类型须随签名一起转换（tensor→memref）
+    target.addDynamicallyLegalOp<mlir::func::ReturnOp>(
+        [&](mlir::func::ReturnOp op) {
+          return typeConverter.isLegal(op.getOperandTypes());
+        });
 
     // --- 3. 注册 patterns（converter 在构造时绑定到每个 pattern）---
     mlir::RewritePatternSet patterns(ctx);
@@ -155,6 +161,8 @@ struct LowerMyDialectPrintPass
     // func.func 签名重写（承接上面的 addDynamicallyLegalOp）
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
         patterns, typeConverter);
+    // func.return 操作数类型重写
+    mlir::populateReturnOpTypeConversionPattern(patterns, typeConverter);
 
     // --- 4. applyPartialConversion ---
     // MLIR 22 不再接受 TypeConverter* 作第 4 个参数（改为 ConversionConfig），

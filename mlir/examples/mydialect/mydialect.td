@@ -181,6 +181,7 @@ def StoreOp : Op<MyDialect, "store"> {
   let hasVerifier = 1;
 }
 
+include "TensorOps.td"
 
 #endif
 
