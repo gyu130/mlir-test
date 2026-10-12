@@ -41,25 +41,66 @@ void MyDialect::initialize() {
       >();
 }
 
-// 类型解析：mydialect.wrapped_i32
+
 mlir::Type MyDialect::parseType(mlir::DialectAsmParser &parser) const {
-  llvm::StringRef keyword;
+  mlir::StringRef keyword;
   if (parser.parseKeyword(&keyword))
     return nullptr;
-  if (keyword == "wrapped_i32")
+
+  if (keyword == "wrapped_i32") {
     return WrappedI32Type::get(parser.getContext());
+  }
+
+  // 格式：tensor<[d0,d1,...], elemTy>，shape 允许空 []
+  if (keyword == "tensor") {
+    mlir::SmallVector<int64_t, 4> dims;
+    if (parser.parseLess() || parser.parseLSquare())
+      return nullptr;
+
+    // parseOptionalRSquare：']' 存在并消费时返回 success（见 AsmParserImpl.h）
+    if (failed(parser.parseOptionalRSquare())) {
+      do {
+        int64_t v;
+        if (parser.parseInteger(v))
+          return nullptr;
+        dims.push_back(v);
+      } while (succeeded(parser.parseOptionalComma()));
+      if (parser.parseRSquare())
+        return nullptr;
+    }
+
+    mlir::Type elemTy;
+    if (parser.parseComma() || parser.parseType(elemTy) ||
+        parser.parseGreater())
+      return nullptr;
+
+    mlir::Builder b(parser.getContext());
+    mlir::ArrayAttr shapeAttr = b.getI64ArrayAttr(dims);
+    return mydialect::MyTensorType::get(parser.getContext(), shapeAttr, elemTy);
+  }
+
   parser.emitError(parser.getNameLoc(), "unknown mydialect type: ") << keyword;
   return nullptr;
 }
 
-// 类型打印：直接输出 wrapped_i32
 void MyDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const {
-  if (mlir::isa<WrappedI32Type>(type)) {
+  if (auto wrappedTy = mlir::dyn_cast<mydialect::WrappedI32Type>(type)) {
     printer << "wrapped_i32";
-    return;
+  } else if (auto tensorTy = mlir::dyn_cast<mydialect::MyTensorType>(type)) {
+    printer << "tensor<[";
+    auto shapeAttr = tensorTy.getShape();
+    for (size_t i = 0; i < shapeAttr.size(); i++) {
+      if (i > 0) printer << ",";
+      auto intAttr = mlir::cast<mlir::IntegerAttr>(shapeAttr[i]);
+      printer << intAttr.getInt();
+    }
+    printer << "], " << tensorTy.getElementType() << ">";
+  } else {
+    llvm_unreachable("unhandled mydialect type");
   }
-  llvm_unreachable("unknown type in mydialect printType");
 }
+
+
 
 // -------- custom assembly for PrintOp --------
 void PrintOp::print(mlir::OpAsmPrinter &printer) {

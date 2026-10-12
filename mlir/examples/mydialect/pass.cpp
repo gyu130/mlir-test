@@ -58,9 +58,37 @@ struct PrintOpLowering : public mlir::OpConversionPattern<mydialect::PrintOp> {
     auto loc = op.getLoc();
     auto sym = mlir::SymbolRefAttr::get(rewriter.getContext(), "my_runtime_print_i32");
     mlir::Value val = adaptor.getValue();
+
+    // ---- tensor 类型（converter 已把 MyTensorType 转为 memref）----
+    // 逐元素打印：按静态 shape 生成嵌套 scf.for，body 内 memref.load
+    // 后调用 my_runtime_print_i32
+    if (auto memrefTy = mlir::dyn_cast<mlir::MemRefType>(val.getType())) {
+      if (llvm::any_of(memrefTy.getShape(), [](int64_t d) {
+            return mlir::ShapedType::isDynamic(d);
+          }))
+        return rewriter.notifyMatchFailure(op,
+                                           "print: dynamic shape not supported");
+
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      llvm::SmallVector<mlir::Value, 4> ivs;
+      for (int64_t d : memrefTy.getShape()) {
+        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
+        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
+        ivs.push_back(loop.getInductionVar());
+        // 下一层循环/最终 load 都建在本层 body 内
+        rewriter.setInsertionPointToStart(loop.getBody());
+      }
+      mlir::Value elem = rewriter.create<mlir::memref::LoadOp>(loc, val, ivs);
+      mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, elem);
+      rewriter.eraseOp(op);
+      return mlir::success();
+    }
+
+    // ---- 标量：wrapped_i32 显式擦除为 i32 ----
     // 上游 wrap 可能尚未转换，此时 val 仍是 wrapped_i32；
-    // 显式插入 unrealized_conversion_cast 擦除为 i32，
-    // 待 wrap 转换（identity 透传）后该 cast 会被驱动自动折叠掉。
+    // 插入 unrealized_conversion_cast，待 wrap 转换后自动折叠。
     if (mlir::isa<mydialect::WrappedI32Type>(val.getType())) {
       val = rewriter.create<mlir::UnrealizedConversionCastOp>(
           loc, rewriter.getI32Type(), val).getResult(0);

@@ -13,19 +13,18 @@ include(HandleLLVMOptions)
 #include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
 
 set(LLVM_TARGET_DEFINITIONS mydialect.td)
-mlir_tablegen(mydialect.h.inc -gen-dialect-decls)
-mlir_tablegen(mydialect.cpp.inc -gen-dialect-defs)
+mlir_tablegen(mydialect.h.inc -gen-dialect-decls -dialect=mydialect)
+mlir_tablegen(mydialect.cpp.inc -gen-dialect-defs -dialect=mydialect)
 mlir_tablegen(mydialect-opdefs.h.inc -gen-op-decls)
 mlir_tablegen(mydialect-opdefs.cpp.inc -gen-op-defs)
-mlir_tablegen(mydialect.typedefs.h.inc -gen-typedef-decls)
-mlir_tablegen(mydialect.typedefs.cpp.inc -gen-typedef-defs)
+mlir_tablegen(mydialect.typedefs.h.inc -gen-typedef-decls --typedefs-dialect=mydialect)
+mlir_tablegen(mydialect.typedefs.cpp.inc -gen-typedef-defs --typedefs-dialect=mydialect)
 add_public_tablegen_target(MyDialectTableGen)
 
 unset(LLVM_TARGET_DEFINITIONS)
 set(LLVM_TARGET_DEFINITIONS MyDialectPasses.td)
 mlir_tablegen(MyDialectPasses.h.inc -gen-pass-decls)
 add_public_tablegen_target(MLIRMyDialectPassesIncGen)
-
 
 unset(LLVM_TARGET_DEFINITIONS)
 set(LLVM_TARGET_DEFINITIONS MyOptPass.td)

@@ -46,6 +46,23 @@ struct MyDialectTypeConverter : public mlir::TypeConverter {
           return builder.create<mlir::UnrealizedConversionCastOp>(
               loc, resultType, inputs[0]).getResult(0);
         });
+
+    // 在 TypeConverter 构造/setup 函数内添加：
+    addConversion([](mydialect::MyTensorType tensorTy) -> mlir::Type {
+      // 取出 attr 参数
+      mlir::ArrayAttr shapeAttr = tensorTy.getShape();
+      mlir::Type elemTy = tensorTy.getElementType();
+
+      mlir::SmallVector<int64_t,4> dims;
+      for(auto attr : shapeAttr) {
+        auto intAttr = mlir::cast<mlir::IntegerAttr>(attr);
+        dims.push_back(intAttr.getInt());
+      }
+      // 降级目标：memref<dims, elemTy>
+      return mlir::MemRefType::get(dims, elemTy);
+   });
+
+
   }
 };
 
@@ -124,18 +141,20 @@ struct LowerMyDialectPrintPass
     // 转换结束时驱动会自动折叠掉已解耦的 cast。
     target.addLegalOp<mlir::UnrealizedConversionCastOp>();
 
-    // 说明：MLIR 22 的 ConversionTarget 没有 addDynamicallyLegalType。
-    // 类型合法性由绑定在 OpConversionPattern 上的 TypeConverter 驱动：
-    // 转换驱动在应用 pattern 时取 pattern 的 converter，对操作数/结果
-    // 自动做类型重映射，转换前后类型不一致处插入 materialization
-    // （默认 unrealized_conversion_cast）。当前 converter 为 identity，
-    // 所有现有类型合法；将来加入自定义类型时，除了 addConversion，
-    // 还需对承载该类型的 op（如 func.func）addDynamicallyLegalOp，
-    // 在回调里用 typeConverter.isLegal(...) / isSignatureLegal(...) 判定。
+    // 自定义类型（wrapped_i32/mydialect.tensor）出现时 func.func 签名必须转换：
+    // dialect 级 addLegalDialect 不感知操作数类型，需按签名动态判定合法性，
+    // 配合 populateFunctionOpInterfaceTypeConversionPattern 完成重写
+    // （MyTensorType→memref<...>、WrappedI32Type→i32 由 converter 完成）
+    target.addDynamicallyLegalOp<mlir::func::FuncOp>([&](mlir::func::FuncOp op) {
+      return typeConverter.isSignatureLegal(op.getFunctionType());
+    });
 
     // --- 3. 注册 patterns（converter 在构造时绑定到每个 pattern）---
     mlir::RewritePatternSet patterns(ctx);
     mydialect::populateMyDialectToLowerPatterns(patterns, typeConverter);
+    // func.func 签名重写（承接上面的 addDynamicallyLegalOp）
+    mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
+        patterns, typeConverter);
 
     // --- 4. applyPartialConversion ---
     // MLIR 22 不再接受 TypeConverter* 作第 4 个参数（改为 ConversionConfig），

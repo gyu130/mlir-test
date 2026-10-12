@@ -2,6 +2,10 @@
 #define MYDIALECT_TD
 
 include "mlir/IR/OpBase.td"
+include "mlir/IR/AttrTypeBase.td"
+
+include "mlir/IR/BuiltinAttributes.td"
+include "mlir/IR/BuiltinTypes.td"
 
 def MyDialect : Dialect {
   let name = "mydialect";
@@ -22,6 +26,17 @@ def MyDialect : Dialect {
 // 并手写 parseType/printType 支持汇编中的 mydialect.wrapped_i32
 def WrappedI32Type : TypeDef<MyDialect, "WrappedI32"> {
   let mnemonic = "wrapped_i32";        // 汇编中显示为 mydialect.wrapped_i32
+}
+
+// 自定义张量类型：shape 是 ArrayAttr，elementType 是 Type
+def MyTensorType : TypeDef<MyDialect, "MyTensor"> {
+  let mnemonic = "tensor"; // IR文本: mydialect.tensor<...>
+  let parameters = (ins
+    AttrParameter<"::mlir::ArrayAttr", "shape">:$shape,
+    TypeParameter<"::mlir::Type", "elementType">:$elementType
+  );
+  //let assemblyFormat = "`<` $shape `,` $elementType `>`";
+  let hasCustomAssemblyFormat = 1;
 }
 
 // unwrap 算子：mydialect.unwrap : wrapped_i32 -> i32（显式去包装，供测试用）
@@ -165,7 +180,6 @@ def StoreOp : Op<MyDialect, "store"> {
   let assemblyFormat = "$value `,` $memref `,` $index attr-dict `:` type($value) `,` type($memref)";
   let hasVerifier = 1;
 }
-
 
 
 #endif
