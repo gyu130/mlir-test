@@ -323,6 +323,7 @@ static void registerTestPasses() {
 #endif
 
 #include "mydialect/MyDialect.h"
+#include "mydialect/ONNXToMyDialect.h"
 int main(int argc, char **argv) {
   registerAllPasses();
 #ifdef MLIR_INCLUDE_TESTS
@@ -331,6 +332,7 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   registerAllDialects(registry);
   registry.insert<mydialect::MyDialect>();
+  registry.insert<mlir::onnx::OnnxDialect>();
   registerAllExtensions(registry);
 
   // TODO: Remove this and the corresponding MLIRToLLVMIRTranslationRegistration

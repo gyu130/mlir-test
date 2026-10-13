@@ -22,6 +22,17 @@ mlir_tablegen(mydialect.typedefs.h.inc -gen-typedef-decls --typedefs-dialect=myd
 mlir_tablegen(mydialect.typedefs.cpp.inc -gen-typedef-defs --typedefs-dialect=mydialect DEPENDS ${ADDITIONAL_TABLEGEN_DEPENDS})
 add_public_tablegen_target(MyDialectTableGen)
 
+# ======================= ONNX stub dialect TableGen ========================
+# 生成 onnx.h.inc / onnx.cpp.inc / onnx-opdefs.h.inc / onnx-opdefs.cpp.inc
+# 用于 ONNX → MyDialect 转换演示，使用 MLIR builtin tensor 类型，无外部依赖
+set(LLVM_TARGET_DEFINITIONS ONNXOps.td)
+mlir_tablegen(onnx.h.inc -gen-dialect-decls -dialect=onnx)
+mlir_tablegen(onnx.cpp.inc -gen-dialect-defs -dialect=onnx)
+mlir_tablegen(onnx-opdefs.h.inc -gen-op-decls)
+mlir_tablegen(onnx-opdefs.cpp.inc -gen-op-defs)
+add_public_tablegen_target(OnnxStubTableGen)
+set_property(TARGET OnnxStubTableGen PROPERTY FOLDER "MLIR/Tablegen")
+
 unset(LLVM_TARGET_DEFINITIONS)
 set(LLVM_TARGET_DEFINITIONS MyDialectPasses.td)
 mlir_tablegen(MyDialectPasses.h.inc -gen-pass-decls)
@@ -38,8 +49,10 @@ add_library(MyDialectLib
   pass.cpp
   LowerMyDialectPrint.cpp
   MyOptPass.cpp
+  ONNXToMyDialect.cpp
+  mydialect-ops.cpp
 )
-add_dependencies(MyDialectLib MyDialectTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen)
+add_dependencies(MyDialectLib MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen)
 llvm_process_sources(MyDialectLib PARTIAL_SOURCES_INTENDED)
 target_compile_options(MyDialectLib PRIVATE -fno-rtti)
 

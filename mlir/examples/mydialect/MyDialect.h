@@ -27,8 +27,9 @@ class WrappedI32Type;
 #define GET_TYPEDEF_CLASSES
 #include "mydialect.typedefs.h.inc"
 
-// TableGen 生成的 Op 完整类声明（-gen-op-decls 产物；
-// 不定义 GET_OP_CLASSES 时只有前向声明）
+// TableGen 生成的 Op 完整类声明（-gen-op-decls 产物）
+// 注意：mydialect-opdefs.h.inc 使用 GET_OP_CLASSES 作为 guard
+// （GET_OP_DECLS 是无效的，会跳过整个声明块）
 #define GET_OP_CLASSES
 #include "mydialect-opdefs.h.inc"
 

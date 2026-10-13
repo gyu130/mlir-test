@@ -92,6 +92,8 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/pass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LowerMyDialectPrint.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/MyOptPass.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/ONNXToMyDialect.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/mydialect-ops.cpp
   SUPPORT_PLUGINS
   )
 mlir_target_link_libraries(mlir-opt PRIVATE ${LIBS})
@@ -114,8 +116,8 @@ target_include_directories(MLIRMlirOptMain PRIVATE
   ${MLIR_BINARY_DIR}/examples/mydialect
 )
 
-add_dependencies(MLIRMlirOptMain MyDialectTableGen)
-add_dependencies(mlir-opt MyDialectTableGen MLIRMyDialectPassesIncGen)
+add_dependencies(MLIRMlirOptMain MyDialectTableGen OnnxStubTableGen)
+add_dependencies(mlir-opt MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen)
 mlir_target_link_libraries(mlir-opt PRIVATE
   MLIRMemRefDialect
   MLIRSCFDialect

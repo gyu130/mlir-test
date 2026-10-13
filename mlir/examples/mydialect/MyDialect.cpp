@@ -296,39 +296,8 @@ mlir::LogicalResult StoreOp::verify() {
   return mlir::success();
 }
 
-// ====== 张量逐元素 op verify：shape/元素类型一致性，cmpi 结果须为 i1 ======
-mlir::LogicalResult AddTensorOp::verify() {
-  auto lhsTy = mlir::cast<mydialect::MyTensorType>(getLhs().getType());
-  auto rhsTy = mlir::cast<mydialect::MyTensorType>(getRhs().getType());
-  if (lhsTy.getShape() != rhsTy.getShape())
-    return emitOpError() << "add_tensor: shape mismatch";
-  if (lhsTy.getElementType() != rhsTy.getElementType())
-    return emitOpError() << "add_tensor: element type mismatch";
-  return mlir::success();
-}
-
-mlir::LogicalResult MulTensorOp::verify() {
-  auto lhsTy = mlir::cast<mydialect::MyTensorType>(getLhs().getType());
-  auto rhsTy = mlir::cast<mydialect::MyTensorType>(getRhs().getType());
-  if (lhsTy.getShape() != rhsTy.getShape())
-    return emitOpError() << "mul_tensor: shape mismatch";
-  if (lhsTy.getElementType() != rhsTy.getElementType())
-    return emitOpError() << "mul_tensor: element type mismatch";
-  return mlir::success();
-}
-
-mlir::LogicalResult CmpITensorOp::verify() {
-  auto lhsTy = mlir::cast<mydialect::MyTensorType>(getLhs().getType());
-  auto rhsTy = mlir::cast<mydialect::MyTensorType>(getRhs().getType());
-  if (lhsTy.getShape() != rhsTy.getShape())
-    return emitOpError() << "cmpi_tensor: shape mismatch";
-  if (lhsTy.getElementType() != rhsTy.getElementType())
-    return emitOpError() << "cmpi_tensor: element type mismatch";
-  auto resTy = mlir::cast<mydialect::MyTensorType>(getRes().getType());
-  if (resTy.getElementType() != mlir::IntegerType::get(getContext(), 1))
-    return emitOpError() << "cmpi_tensor: result element must be i1";
-  return mlir::success();
-}
+// ====== 张量 op verify() 已移至 mydialect-ops.cpp 统一实现 ======
+// 此处不再重复定义，避免链接期 duplicate symbol 错误
 
 // AddI32Op: fold(lhs + rhs)
 ::mlir::OpFoldResult mydialect::AddI32Op::fold(FoldAdaptor adaptor) {
@@ -536,7 +505,6 @@ void registerMyDialectPasses() {
 }
 } // namespace mydialect
 
-// 生成各 Op 的方法定义（build/create/verify 等）及 TypeID 定义
-#define GET_OP_CLASSES
-#include "mydialect-opdefs.cpp.inc"
+// 注意：GET_OP_CLASSES + mydialect-opdefs.cpp.inc 的方法定义已统一在 mydialect-ops.cpp
+// 此处不再重复 include，避免链接期 duplicate symbol 错误
 
