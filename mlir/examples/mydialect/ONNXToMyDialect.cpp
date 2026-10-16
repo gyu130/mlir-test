@@ -259,6 +259,31 @@ struct ConvertONNXReduceSum
   }
 };
 
+// arith.constant（结果类型为 ranked tensor）-> mydialect.constant_tensor
+// 说明：本 pass 把 builtin tensor 全部转成 mydialect 张量。若某个张量常量
+// 仍由 arith.constant（合法 op）产出，其值被转换后的 op 消费时会插入
+// unrealized_conversion_cast 且无法消解（因为生产方是合法 op 不会被转换），
+// 报 "unresolved materialization ... remained live"。故把张量类型的
+// arith.constant 一并转换为 mydialect.constant_tensor（标量 i64/i1 常量
+// 保持 arith.constant 不变，由 target 的动态合法性保证）。
+struct ConvertArithConstant : public OpConversionPattern<arith::ConstantOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    if (!llvm::isa<RankedTensorType>(op.getType()))
+      return failure();
+    auto outTy = getTypeConverter()->convertType(op.getType());
+    if (!outTy)
+      return failure();
+    // arith.constant 的 value 是 TypedAttr；张量常量必为 ElementsAttr
+    auto valueAttr = llvm::cast<ElementsAttr>(op.getValue());
+    auto newOp = rewriter.create<mydialect::ConstantTensorOp>(
+        op.getLoc(), outTy, valueAttr);
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
 // ONNX.Loop -> mydialect.loop
 // 结果类型：逐个转换为 mydialect 张量；region 整体移入新算子，
 // region 内的 ONNX 操作（含终止符 ONNXLoopYieldOp）再由各自的 pattern 转换。
@@ -279,6 +304,12 @@ struct ConvertONNXLoop : public OpConversionPattern<mlir::onnx::ONNXLoopOp> {
     // 把原 ONNX body region 移入新算子（单块 region，保持原有内容）
     rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
                                 newOp.getBody().end());
+    // ONNX Loop body 采用块参数（iter, cond, carries），类型用的是 builtin
+    // tensor；需按 TypeConverter 转换块参数类型，否则 region 内被转换后的
+    // mydialect 张量操作数类型会不匹配（如 add_tensor 要求 MyTensorType）。
+    if (failed(rewriter.convertRegionTypes(&newOp.getBody(),
+                                           *getTypeConverter())))
+      return failure();
     rewriter.replaceOp(op, newOp.getResults());
     return success();
   }
@@ -311,6 +342,7 @@ void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
     ConvertONNXReshape,
     ConvertONNXTranspose,
     ConvertONNXReduceSum,
+    ConvertArithConstant,
     ConvertONNXLoop,
     ConvertONNXLoopYield
   >(typeConverter, patterns.getContext());
@@ -357,6 +389,13 @@ struct ConvertOnnxToMyDialectPass
     // UnrealizedConversionCastOp 在函数签名转换时会自动插入（用于桥接旧/新类型）
     // 必须显式合法化，否则整个 pattern 应用被回滚
     target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+
+    // arith.constant 默认随 arith 方言合法；但结果类型为 ranked tensor 的常量
+    // 需转为 mydialect.constant_tensor（否则张量常量被转换后的 op 消费时会残留
+    // 无法消解的 unrealized_conversion_cast）。标量常量保持合法不变。
+    target.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
+      return !llvm::isa<RankedTensorType>(op.getType());
+    });
 
     // func.func 签名合法性：当函数参数/返回类型包含 onnx builtin tensor 时
     // 需要转换为 mydialect 张量类型

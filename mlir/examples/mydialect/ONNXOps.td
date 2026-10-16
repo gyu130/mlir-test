@@ -95,9 +95,10 @@ def ONNXReduceSumOp : Op<OnnxDialect, "ReduceSum", [Pure]> {
 
 //============================= ONNX Loop =============================
 // 对标 ONNX Loop：最大迭代次数 + 条件 + 循环携带张量，body 产出 (cond, carry)。
-// 与 mydialect 侧 LoopOp 保持一致：body region 无块参数（declarative 格式限制），
-// 测试写作通用形式 "onnx.Loop" ... ({ ... })。
-def ONNXLoopYieldOp : Op<OnnxDialect, "LoopYield", [
+// 终止符 mnemonic 用 "Yield"（即 onnx.Yield），与真实 onnx-mlir 命名一致。
+// ONNX Loop 的 body 采用块参数形式（iter, cond, carries），
+// 测试可用通用形式 "onnx.Loop" ... ({ ^bb0(...): ... })。
+def ONNXLoopYieldOp : Op<OnnxDialect, "Yield", [
   Pure,
   Terminator,
   ParentOneOf<["ONNXLoopOp"]>
