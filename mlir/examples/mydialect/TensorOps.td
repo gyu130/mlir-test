@@ -125,4 +125,48 @@ def ReduceSumTensorOp : Op<MyDialect, "reduce_sum_tensor", [
   let assemblyFormat = "$data `,` $axes `,` $keep_dims attr-dict `:` type($data) `->` type($res)";
 }
 
+// ===================== 循环算子：对标 ONNX Loop =====================
+// 注意：本算子不同于 mydialect.td 中既有的标量 ForOp/YieldOp，必须使用
+// 独立的 def 名称与 mnemonic，否则 TableGen 会报 "def already exists"。
+// 设计：
+//   - maxTripCount(i64) 最大迭代次数，initCond(i1) 初始条件
+//   - initArgs 循环携带张量初始值，results 为其最终值
+//   - body 单块 region，隐式终止符 LoopYieldOp 产出 (newCond, newCarryArgs)
+// 说明：不能用 SingleBlockImplicitTerminator —— 该 trait 要求终止符能用
+// 零操作数默认构建，而 LoopYieldOp 的 cond 是必需操作数。改用 SingleBlock，
+// 终止符在 IR 中显式书写，由 LoopOp::verify() 校验其为 LoopYieldOp。
+def LoopOp : Op<MyDialect, "loop", [
+  Pure,
+  SingleBlock
+]> {
+  let arguments = (ins
+    I64:$maxTripCount,               // 最大迭代次数，标量 i64
+    I1:$initCond,                    // 初始条件，标量 i1
+    Variadic<MyTensorType>:$initArgs // 迭代 carry 初始张量参数
+  );
+  let results = (outs
+    Variadic<MyTensorType>:$results
+  );
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+  // 汇编格式：mydialect.loop %m, %cond, %a, %b : (tensor...) -> (tensor...) { ... }
+  let assemblyFormat = "$maxTripCount `,` $initCond `,` $initArgs attr-dict `:` type($initArgs) `->` type($results) $body";
+}
+
+// 循环体终止算子 loop_yield，产出 (newCond, newCarryArgs)
+def LoopYieldOp : Op<MyDialect, "loop_yield", [
+  Pure,
+  Terminator,
+  ParentOneOf<["LoopOp"]>
+]> {
+  let arguments = (ins
+    I1:$cond,
+    Variadic<MyTensorType>:$carryArgs
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+  let assemblyFormat = "$cond `,` $carryArgs attr-dict `:` type($cond) `,` type($carryArgs)";
+}
+
+
 #endif

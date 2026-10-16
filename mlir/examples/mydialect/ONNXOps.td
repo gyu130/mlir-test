@@ -93,4 +93,34 @@ def ONNXReduceSumOp : Op<OnnxDialect, "ReduceSum", [Pure]> {
   let assemblyFormat = "$data (`,` $axes^)? (`,` $keepdims^)? attr-dict `:` type($data) `->` type($output)";
 }
 
+//============================= ONNX Loop =============================
+// 对标 ONNX Loop：最大迭代次数 + 条件 + 循环携带张量，body 产出 (cond, carry)。
+// 与 mydialect 侧 LoopOp 保持一致：body region 无块参数（declarative 格式限制），
+// 测试写作通用形式 "onnx.Loop" ... ({ ... })。
+def ONNXLoopYieldOp : Op<OnnxDialect, "LoopYield", [
+  Pure,
+  Terminator,
+  ParentOneOf<["ONNXLoopOp"]>
+]> {
+  let arguments = (ins I1:$cond, Variadic<AnyTensor>:$carryArgs);
+  let results = (outs);
+  let assemblyFormat = "$cond `,` $carryArgs attr-dict `:` type($cond) `,` type($carryArgs)";
+}
+
+// 同 mydialect::LoopOp：SingleBlockImplicitTerminator 不可用（终止符 cond 必需），
+// 使用 SingleBlock，终止符在 IR 中显式书写。
+def ONNXLoopOp : Op<OnnxDialect, "Loop", [
+  Pure,
+  SingleBlock
+]> {
+  let arguments = (ins
+    I64:$max_trip_count,
+    I1:$cond,
+    Variadic<AnyTensor>:$carried_inputs
+  );
+  let results = (outs Variadic<AnyTensor>:$outputs);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "$max_trip_count `,` $cond `,` $carried_inputs attr-dict `:` type($carried_inputs) `->` type($outputs) $body";
+}
+
 #endif // ONNX_OPS_TD

@@ -85,15 +85,28 @@ mlir::Type mydialect::MyTensorType::parse(mlir::AsmParser &parser) {
       parser.parseGreater())
     return nullptr;
 
-  mlir::Builder b(parser.getContext());
-  mlir::ArrayAttr shapeAttr = b.getI64ArrayAttr(dims);
+  // 注意：shape 属性元素必须是 index 类型的 IntegerAttr，与 TypeConverter
+  // 及各 inferReturnTypes 的构造保持一致。若用 getI64ArrayAttr（i64 属性），
+  // 解析出的类型与代码构造/重新推导出的类型 ArrayAttr 不相等（i64 2 != index 2），
+  // 会导致带 InferTypeOpInterface 的 op 回读时报 "inferred types incompatible"。
+  mlir::SmallVector<mlir::Attribute, 4> shapeAttrVec;
+  for (int64_t d : dims)
+    shapeAttrVec.push_back(
+        mlir::IntegerAttr::get(mlir::IndexType::get(parser.getContext()), d));
+  mlir::ArrayAttr shapeAttr =
+      mlir::ArrayAttr::get(parser.getContext(), shapeAttrVec);
   return MyTensorType::get(parser.getContext(), shapeAttr, elemTy);
 }
 
 void mydialect::MyTensorType::print(mlir::AsmPrinter &printer) const {
-  // stripped 格式（含 mnemonic，不含 !mydialect. 前缀）：
-  // printStrippedAttrOrType 调用本方法，OpAsmPrinter 的 type($x) 据此输出
-  printer << "tensor<[";
+  // 约定（同 async::ValueType）：类型的 print/parse 只处理「类型体」，
+  // 不含 mnemonic（"tensor"）与方言前缀（"!mydialect."）。
+  //   - 完整类型路径：框架输出 "!mydialect."，MyDialect::printType 输出
+  //     mnemonic，再调用本方法输出类型体 -> !mydialect.tensor<[...], i32>
+  //   - op 汇编 stripped 路径：printStrippedAttrOrType 直接调用本方法，
+  //     输出 <[...], i32>，解析时 parseCustomTypeWithFallback 直接调用
+  //     MyTensorType::parse 解析类型体（两条路径共用同一份 parse）。
+  printer << "<[";
   auto shapeAttr = getShape();
   for (size_t i = 0; i < shapeAttr.size(); i++) {
     if (i > 0) printer << ",";
@@ -107,6 +120,8 @@ void MyDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) con
   if (auto wrappedTy = mlir::dyn_cast<mydialect::WrappedI32Type>(type)) {
     printer << "wrapped_i32";
   } else if (auto tensorTy = mlir::dyn_cast<mydialect::MyTensorType>(type)) {
+    // MyTensorType::print 只输出类型体，mnemonic 由这里补
+    printer << mydialect::MyTensorType::getMnemonic();
     tensorTy.print(printer);
   } else {
     llvm_unreachable("unhandled mydialect type");

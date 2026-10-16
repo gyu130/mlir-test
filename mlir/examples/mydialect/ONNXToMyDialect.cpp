@@ -259,6 +259,45 @@ struct ConvertONNXReduceSum
   }
 };
 
+// ONNX.Loop -> mydialect.loop
+// 结果类型：逐个转换为 mydialect 张量；region 整体移入新算子，
+// region 内的 ONNX 操作（含终止符 ONNXLoopYieldOp）再由各自的 pattern 转换。
+struct ConvertONNXLoop : public OpConversionPattern<mlir::onnx::ONNXLoopOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::onnx::ONNXLoopOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> outTys;
+    for (Type t : op.getResultTypes()) {
+      auto converted = getTypeConverter()->convertType(t);
+      if (!converted)
+        return failure();
+      outTys.push_back(converted);
+    }
+    auto newOp = rewriter.create<mydialect::LoopOp>(
+        op.getLoc(), outTys, adaptor.getMaxTripCount(), adaptor.getCond(),
+        adaptor.getCarriedInputs());
+    // 把原 ONNX body region 移入新算子（单块 region，保持原有内容）
+    rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
+                                newOp.getBody().end());
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
+// ONNX.LoopYield -> mydialect.loop_yield
+struct ConvertONNXLoopYield
+    : public OpConversionPattern<mlir::onnx::ONNXLoopYieldOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::onnx::ONNXLoopYieldOp op,
+      OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto newOp = rewriter.create<mydialect::LoopYieldOp>(
+        op.getLoc(), adaptor.getCond(), adaptor.getCarryArgs());
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
 //============================= Pattern 集合注册 =============================
 namespace {
 void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
@@ -271,7 +310,9 @@ void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
     ConvertONNXIdentity,
     ConvertONNXReshape,
     ConvertONNXTranspose,
-    ConvertONNXReduceSum
+    ConvertONNXReduceSum,
+    ConvertONNXLoop,
+    ConvertONNXLoopYield
   >(typeConverter, patterns.getContext());
 }
 } // namespace

@@ -212,4 +212,49 @@ LogicalResult ReduceSumTensorOp::verify() {
   return success();
 }
 
+// ---------------- LoopOp ----------------
+LogicalResult LoopOp::verify() {
+  Region &bodyRegion = getBody();
+  if (bodyRegion.empty())
+    return emitOpError("loop body region must not be empty");
+  Block &bodyBlock = bodyRegion.front();
+  auto yieldOp = llvm::dyn_cast<LoopYieldOp>(bodyBlock.getTerminator());
+  if (!yieldOp)
+    return emitOpError("loop body must end with mydialect.loop_yield");
+
+  // 1. yield carryArgs 数量必须等于 initArgs 数量
+  size_t carryNum = getInitArgs().size();
+  if (yieldOp.getCarryArgs().size() != carryNum)
+    return emitOpError("yield carry args count must match loop initArgs count");
+  // 2. results 数量必须等于 initArgs 数量
+  if (getResults().size() != carryNum)
+    return emitOpError("loop results count must match initArgs count");
+
+  // 3. 类型校验：yield carry 张量类型与 loop 结果类型一致
+  for (auto [yieldVal, resVal] :
+       llvm::zip(yieldOp.getCarryArgs(), getResults())) {
+    auto yieldTy = llvm::dyn_cast<mydialect::MyTensorType>(yieldVal.getType());
+    auto resTy = llvm::dyn_cast<mydialect::MyTensorType>(resVal.getType());
+    if (!yieldTy || !resTy)
+      return emitOpError("carry value must be mydialect tensor");
+    if (yieldTy != resTy)
+      return emitOpError(
+          "yield carry tensor type mismatch with loop result type");
+  }
+  return success();
+}
+
+// ---------------- LoopYieldOp ----------------
+LogicalResult LoopYieldOp::verify() {
+  // cond 操作数必须是 i1
+  if (!getCond().getType().isInteger(1))
+    return emitOpError("cond operand must be i1");
+  // carry args 必须全部是 mydialect 张量
+  for (auto carry : getCarryArgs()) {
+    if (!llvm::dyn_cast<mydialect::MyTensorType>(carry.getType()))
+      return emitOpError("carry argument must be mydialect tensor");
+  }
+  return success();
+}
+
 } // namespace mydialect
