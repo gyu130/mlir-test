@@ -124,4 +124,12 @@ def ONNXLoopOp : Op<OnnxDialect, "Loop", [
   let assemblyFormat = "$max_trip_count `,` $cond `,` $carried_inputs attr-dict `:` type($carried_inputs) `->` type($outputs) $body";
 }
 
+// onnx-mlir 生成的入口标记：generic 语法以 properties 形式携带 func 符号引用
+// （"onnx.EntryPoint"() <{func = @main_graph}> : () -> ()），
+// 因此必须声明 func 属性，否则报 "this operation does not support properties"。
+def ONNXEntryPointOp : Op<OnnxDialect, "EntryPoint", []> {
+  let arguments = (ins FlatSymbolRefAttr:$func);
+  let results = (outs);
+}
+
 #endif // ONNX_OPS_TD

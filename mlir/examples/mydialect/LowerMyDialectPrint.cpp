@@ -9,6 +9,8 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "MyDialect.h"
 #include "pass.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include <memory>
 
 namespace mydialect {
@@ -132,6 +134,10 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::AllocOp>();
     target.addIllegalOp<mydialect::LoadOp>();
     target.addIllegalOp<mydialect::StoreOp>();
+    target.addIllegalOp<mydialect::LoopOp>();
+    target.addIllegalOp<mydialect::LoopYieldOp>();
+    target.addIllegalOp<mydialect::ConstantTensorOp>();
+    target.addIllegalOp<mydialect::AddTensorOp>();
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addLegalDialect<mlir::arith::ArithDialect>();

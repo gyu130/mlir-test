@@ -58,7 +58,7 @@ def CmpITensorOp : Op<MyDialect, "cmpi_tensor", [
 def ConstantTensorOp : Op<MyDialect, "constant_tensor", [
   Pure,
   DeclareOpInterfaceMethods<InferTypeOpInterface>,
-  ConstantLike
+ // ConstantLike
 ]> {
   let arguments = (ins
     ElementsAttr:$value
@@ -66,6 +66,10 @@ def ConstantTensorOp : Op<MyDialect, "constant_tensor", [
   let results = (outs MyTensorType:$res);
   let hasVerifier = 1;
   let assemblyFormat = "$value attr-dict `:` type($res)";
+  
+  let extraClassDeclaration = [{
+    ::mlir::LogicalResult getConstantValue(::mlir::Attribute &value);
+  }];
 }
 
 //===================== 张量 identity identity_tensor =====================

@@ -329,6 +329,15 @@ struct ConvertONNXLoopYield
   }
 };
 
+struct ConvertONNXEntryPoint : public OpConversionPattern<mlir::onnx::ONNXEntryPointOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::onnx::ONNXEntryPointOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 //============================= Pattern 集合注册 =============================
 namespace {
 void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
@@ -344,7 +353,8 @@ void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
     ConvertONNXReduceSum,
     ConvertArithConstant,
     ConvertONNXLoop,
-    ConvertONNXLoopYield
+    ConvertONNXLoopYield,
+    ConvertONNXEntryPoint
   >(typeConverter, patterns.getContext());
 }
 } // namespace

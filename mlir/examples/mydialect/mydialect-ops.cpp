@@ -92,6 +92,12 @@ LogicalResult ConstantTensorOp::inferReturnTypes(
   return success();
 }
 
+LogicalResult ConstantTensorOp::getConstantValue(Attribute &value) {
+  auto props = getProperties();
+  value = props.value;
+  return success();
+}
+
 LogicalResult ConstantTensorOp::verify() {
   auto resTy = llvm::dyn_cast<mydialect::MyTensorType>(getRes().getType());
   auto elemAttr = getValue();
