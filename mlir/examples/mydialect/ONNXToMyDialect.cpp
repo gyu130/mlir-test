@@ -17,12 +17,14 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
 
@@ -35,6 +37,39 @@ using namespace mlir;
 #include "onnx-opdefs.cpp.inc"
 
 namespace mlir::onnx {
+
+// ============================================================================
+// ONNXConstantOp 自定义 assembler
+// onnx-mlir 输出格式：%0 = onnx.Constant dense<1> : tensor<i64>
+// （没有额外属性，没有 attr-dict）
+// ODS assemblyFormat 强制 attr-dict 指令，但 op 没有额外 attribute 时
+// 会强制期待 {} 或内联属性，导致 "expected ':'" 解析错误。
+// 因此用 hasCustomAssemblyFormat=1 自己实现 parse/print。
+// ============================================================================
+mlir::ParseResult ONNXConstantOp::parse(mlir::OpAsmParser &parser,
+                                       mlir::OperationState &result) {
+  // onnx.Constant 的输入格式就是 ElementsAttr 的标准字符串：
+  //   onnx.Constant dense<1> : tensor<i64>
+  // 这里整个 `dense<1> : tensor<i64>` 是一个完整的 ElementsAttr，
+  // parseAttribute 会一次性吃掉它（ElementsAttr 自带值和类型）。
+  // 然后从 ElementsAttr 的 getType() 里提取 result type。
+  mlir::Attribute valueAttrRaw;
+  if (parser.parseAttribute(valueAttrRaw))
+    return mlir::failure();
+  auto valueAttr = mlir::dyn_cast_or_null<mlir::ElementsAttr>(valueAttrRaw);
+  if (!valueAttr)
+    return parser.emitError(parser.getCurrentLocation(),
+                            "expected ElementsAttr for onnx.Constant");
+  result.getOrAddProperties<ONNXConstantOp::Properties>().value = valueAttr;
+  result.addTypes(valueAttr.getType());
+  return mlir::success();
+}
+
+void ONNXConstantOp::print(mlir::OpAsmPrinter &printer) {
+  printer << ' ';
+  // 直接打印完整 ElementsAttr（值 : 类型）—— 与 onnx-mlir 输出格式一致
+  printer << getValueAttr();
+}
 
 // OnnxDialect::initialize() 由 onnx.h.inc 声明，这里实现：
 // 注册所有 stub ONNX ops
@@ -54,170 +89,165 @@ void OnnxDialect::initialize() {
 // TypeConverter 同时支持两个方向的转换（LIFO 兜底后注册具体规则）。
 struct OnnxToMyDialectTypeConverter : public mlir::TypeConverter {
   OnnxToMyDialectTypeConverter() {
-    // 1. identity 兜底（先注册，后尝试）—— 必须在具体规则前注册
-    addConversion([](mlir::Type type) -> std::optional<mlir::Type> {
-      return type;
-    });
-
-    // 2. builtin RankedTensorType -> mydialect::MyTensorType
-    // 仅支持静态 shape（动态 shape 会在 pattern 内 notifyMatchFailure）
-    // 注意：不添加反向 MyTensorType -> RankedTensorType 转换，否则
-    // 转换后的 mydialect 张量类型会被 isLegal() 判定为非法（因再次转换回
-    // builtin tensor 后与原类型不同），导致 FuncOp 签名转换死循环。
-    addConversion([](mlir::RankedTensorType ty) -> std::optional<mlir::Type> {
-      if (!ty.hasStaticShape())
-        return std::nullopt;
-      auto ctx = ty.getContext();
-      SmallVector<mlir::Attribute> shapeAttrVec;
-      for (int64_t dim : ty.getShape()) {
-        shapeAttrVec.push_back(
-            mlir::IntegerAttr::get(mlir::IndexType::get(ctx), dim));
+    // 单规则：优先 RankedTensorType → MyTensorType，其余 identity
+    addConversion([](mlir::Type ty) -> std::optional<mlir::Type> {
+      if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(ty)) {
+        if (!rtt.hasStaticShape()) return std::nullopt;
+        auto ctx = ty.getContext();
+        SmallVector<mlir::Attribute> shapeAttrVec;
+        for (int64_t dim : rtt.getShape())
+          shapeAttrVec.push_back(mlir::IntegerAttr::get(mlir::IndexType::get(ctx), dim));
+        auto shapeAttr = mlir::ArrayAttr::get(ctx, shapeAttrVec);
+        return mydialect::MyTensorType::get(ctx, shapeAttr, rtt.getElementType());
       }
-      auto shapeAttr = mlir::ArrayAttr::get(ctx, shapeAttrVec);
-      return mydialect::MyTensorType::get(ctx, shapeAttr, ty.getElementType());
+      return ty;  // identity
     });
   }
 };
 
 //============================= 8 个 ConversionPattern =======================
 
-// ONNX.Add -> mydialect.add_tensor
-struct ConvertONNXAdd : public OpConversionPattern<mlir::onnx::ONNXAddOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXAddOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto outTy = getTypeConverter()->convertType(op.getResult().getType());
-    if (!outTy)
-      return failure();
-    auto newOp = rewriter.create<mydialect::AddTensorOp>(
-        op.getLoc(), outTy, adaptor.getA(), adaptor.getB());
-    rewriter.replaceOp(op, newOp);
+// 通用 helper：把值通过 TypeConverter 转成目标类型，如果需要则 materialize cast
+// 用于 ONNX op pattern 里手动 cast adaptor operands（避免反向 cast 套娃）。
+static mlir::Value castIfNeeded(const mlir::TypeConverter &converter,
+                                mlir::OpBuilder &builder, mlir::Location loc,
+                                mlir::Value v) {
+  auto targetTy = converter.convertType(v.getType());
+  if (!targetTy || targetTy == v.getType())
+    return v;
+  return builder.create<mlir::UnrealizedConversionCastOp>(loc, targetTy, v)
+      .getResult(0);
+}
+
+// 通用 helper：把 RankedTensorType 转成 MyTensorType（如果是 tensor 类型）
+static mlir::Type tensorTypeOrSelf(const mlir::TypeConverter &converter, mlir::Type t) {
+  return converter.convertType(t);
+}
+
+// ONNX.Add -> mydialect.add_tensor（RewritePattern，不依赖 adaptor）
+struct ConvertONNXAdd : public mlir::OpRewritePattern<mlir::onnx::ONNXAddOp> {
+  ConvertONNXAdd(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXAddOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getResult().getType());
+    if (!outTy) return failure();
+    auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
+    auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
+    rewriter.replaceOpWithNewOp<mydialect::AddTensorOp>(op, outTy, a, b);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Mul -> mydialect.mul_tensor
-struct ConvertONNXMul : public OpConversionPattern<mlir::onnx::ONNXMulOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXMulOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto outTy = getTypeConverter()->convertType(op.getResult().getType());
-    if (!outTy)
-      return failure();
-    auto newOp = rewriter.create<mydialect::MulTensorOp>(
-        op.getLoc(), outTy, adaptor.getA(), adaptor.getB());
-    rewriter.replaceOp(op, newOp);
+struct ConvertONNXMul : public mlir::OpRewritePattern<mlir::onnx::ONNXMulOp> {
+  ConvertONNXMul(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXMulOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getResult().getType());
+    if (!outTy) return failure();
+    auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
+    auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
+    rewriter.replaceOpWithNewOp<mydialect::MulTensorOp>(op, outTy, a, b);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Equal -> mydialect.cmpi_tensor（predicate = 4 表示 "eq"）
-// mydialect::CmpITensorOp 的 predicate 取值范围：0~5（slt/sgt/sle/sge/eq/ne）
-// 这里固定映射到 eq（4）
-struct ConvertONNXEqual : public OpConversionPattern<mlir::onnx::ONNXEqualOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXEqualOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    // 输入张量转换为 mydialect 张量类型
-    auto inTy = getTypeConverter()->convertType(op.getA().getType());
-    if (!inTy)
-      return failure();
-    // 结果类型：i1 张量（mydialect::CmpITensorOp 的 inferReturnTypes 会推导）
-    // 但 applyPartialConversion 需要预先指定结果类型
+struct ConvertONNXEqual : public mlir::OpRewritePattern<mlir::onnx::ONNXEqualOp> {
+  ConvertONNXEqual(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXEqualOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto inTy = tensorTypeOrSelf(converter, op.getA().getType());
+    if (!inTy) return failure();
     auto lhsTensorTy = mlir::cast<mydialect::MyTensorType>(inTy);
     auto i1Ty = IntegerType::get(rewriter.getContext(), 1);
     auto outTy = mydialect::MyTensorType::get(
         rewriter.getContext(), lhsTensorTy.getShape(), i1Ty);
-    // predicate=4 对应 eq
     auto predAttr = rewriter.getI64IntegerAttr(4);
-    auto newOp = rewriter.create<mydialect::CmpITensorOp>(
-        op.getLoc(), outTy, adaptor.getA(), adaptor.getB(), predAttr);
-    rewriter.replaceOp(op, newOp);
+    auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
+    auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
+    rewriter.replaceOpWithNewOp<mydialect::CmpITensorOp>(op, outTy, a, b, predAttr);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Constant -> mydialect.constant_tensor
-struct ConvertONNXConstant
-    : public OpConversionPattern<mlir::onnx::ONNXConstantOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXConstantOp op,
-      OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+struct ConvertONNXConstant : public mlir::OpRewritePattern<mlir::onnx::ONNXConstantOp> {
+  ConvertONNXConstant(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXConstantOp op,
+      mlir::PatternRewriter &rewriter) const override {
     auto valAttr = op.getValueAttr();
-    // 从 ElementsAttr 推导 mydialect 张量类型
     auto st = valAttr.getShapedType();
-    if (!st.hasStaticShape())
-      return failure();
+    if (!st.hasStaticShape()) return failure();
     auto ctx = rewriter.getContext();
     SmallVector<mlir::Attribute> shapeAttrVec;
     for (int64_t d : st.getShape()) {
       shapeAttrVec.push_back(mlir::IntegerAttr::get(mlir::IndexType::get(ctx), d));
     }
     auto shapeAttr = mlir::ArrayAttr::get(ctx, shapeAttrVec);
-    auto outTy =
-        mydialect::MyTensorType::get(ctx, shapeAttr, st.getElementType());
-    auto newOp = rewriter.create<mydialect::ConstantTensorOp>(
-        op.getLoc(), outTy, valAttr);
-    rewriter.replaceOp(op, newOp);
+    auto outTy = mydialect::MyTensorType::get(ctx, shapeAttr, st.getElementType());
+    rewriter.replaceOpWithNewOp<mydialect::ConstantTensorOp>(op, outTy, valAttr);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Identity -> mydialect.identity_tensor
-struct ConvertONNXIdentity
-    : public OpConversionPattern<mlir::onnx::ONNXIdentityOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXIdentityOp op,
-      OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto outTy = getTypeConverter()->convertType(op.getOutput().getType());
-    if (!outTy)
-      return failure();
-    auto newOp = rewriter.create<mydialect::IdentityTensorOp>(
-        op.getLoc(), outTy, adaptor.getInput());
-    rewriter.replaceOp(op, newOp);
+struct ConvertONNXIdentity : public mlir::OpRewritePattern<mlir::onnx::ONNXIdentityOp> {
+  ConvertONNXIdentity(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXIdentityOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
+    auto input = castIfNeeded(converter, rewriter, op.getLoc(), op.getInput());
+    rewriter.replaceOpWithNewOp<mydialect::IdentityTensorOp>(op, outTy, input);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Reshape -> mydialect.reshape_tensor
-// 注意：mydialect::ReshapeTensorOp::inferReturnTypes 返回 failure（shape 是运行时张量）
-// 因此 pattern 需要从 op 的结果类型显式推导输出类型
-struct ConvertONNXReshape
-    : public OpConversionPattern<mlir::onnx::ONNXReshapeOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXReshapeOp op,
-      OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto outTy = getTypeConverter()->convertType(op.getOutput().getType());
-    if (!outTy)
-      return failure();
-    auto newOp = rewriter.create<mydialect::ReshapeTensorOp>(
-        op.getLoc(), outTy, adaptor.getData(), adaptor.getShape());
-    rewriter.replaceOp(op, newOp);
+struct ConvertONNXReshape : public mlir::OpRewritePattern<mlir::onnx::ONNXReshapeOp> {
+  ConvertONNXReshape(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXReshapeOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
+    auto data = castIfNeeded(converter, rewriter, op.getLoc(), op.getData());
+    auto shape = castIfNeeded(converter, rewriter, op.getLoc(), op.getShape());
+    rewriter.replaceOpWithNewOp<mydialect::ReshapeTensorOp>(op, outTy, data, shape);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Transpose -> mydialect.transpose_tensor
-struct ConvertONNXTranspose
-    : public OpConversionPattern<mlir::onnx::ONNXTransposeOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXTransposeOp op,
-      OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto outTy = getTypeConverter()->convertType(op.getOutput().getType());
-    if (!outTy)
-      return failure();
-    // ONNX Transpose 的 perm 是 OptionalAttr；若未指定则按默认逆序
+struct ConvertONNXTranspose : public mlir::OpRewritePattern<mlir::onnx::ONNXTransposeOp> {
+  ConvertONNXTranspose(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXTransposeOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
     ArrayAttr permAttr = op.getPermAttr();
     if (!permAttr) {
-      // 默认：对 N-D 输入按维度逆序构造 perm
-      auto inTensorTy =
-          mlir::dyn_cast<RankedTensorType>(op.getData().getType());
-      if (!inTensorTy)
-        return failure();
+      auto inTensorTy = mlir::dyn_cast<RankedTensorType>(op.getData().getType());
+      if (!inTensorTy) return failure();
       int64_t rank = inTensorTy.getRank();
       SmallVector<mlir::Attribute> defaultPerm;
       for (int64_t i = rank - 1; i >= 0; --i) {
@@ -226,113 +256,192 @@ struct ConvertONNXTranspose
       }
       permAttr = mlir::ArrayAttr::get(rewriter.getContext(), defaultPerm);
     }
-    auto newOp = rewriter.create<mydialect::TransposeTensorOp>(
-        op.getLoc(), outTy, adaptor.getData(), permAttr);
-    rewriter.replaceOp(op, newOp);
+    auto data = castIfNeeded(converter, rewriter, op.getLoc(), op.getData());
+    rewriter.replaceOpWithNewOp<mydialect::TransposeTensorOp>(op, outTy, data, permAttr);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.ReduceSum -> mydialect.reduce_sum_tensor
-struct ConvertONNXReduceSum
-    : public OpConversionPattern<mlir::onnx::ONNXReduceSumOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXReduceSumOp op,
-      OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto outTy = getTypeConverter()->convertType(op.getOutput().getType());
-    if (!outTy)
-      return failure();
-    // axes 缺省时默认空数组（不归约任何维度）
+struct ConvertONNXReduceSum : public mlir::OpRewritePattern<mlir::onnx::ONNXReduceSumOp> {
+  ConvertONNXReduceSum(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXReduceSumOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
     ArrayAttr axesAttr = op.getAxesAttr();
-    if (!axesAttr) {
-      axesAttr = rewriter.getArrayAttr({});
-    }
+    if (!axesAttr) axesAttr = rewriter.getArrayAttr({});
     BoolAttr keepDimsAttr = op.getKeepdimsAttr();
-    if (!keepDimsAttr) {
-      keepDimsAttr = rewriter.getBoolAttr(false);
-    }
-    auto newOp = rewriter.create<mydialect::ReduceSumTensorOp>(
-        op.getLoc(), outTy, adaptor.getData(), axesAttr, keepDimsAttr);
-    rewriter.replaceOp(op, newOp);
+    if (!keepDimsAttr) keepDimsAttr = rewriter.getBoolAttr(false);
+    auto data = castIfNeeded(converter, rewriter, op.getLoc(), op.getData());
+    rewriter.replaceOpWithNewOp<mydialect::ReduceSumTensorOp>(
+        op, outTy, data, axesAttr, keepDimsAttr);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // arith.constant（结果类型为 ranked tensor）-> mydialect.constant_tensor
-// 说明：本 pass 把 builtin tensor 全部转成 mydialect 张量。若某个张量常量
-// 仍由 arith.constant（合法 op）产出，其值被转换后的 op 消费时会插入
-// unrealized_conversion_cast 且无法消解（因为生产方是合法 op 不会被转换），
-// 报 "unresolved materialization ... remained live"。故把张量类型的
-// arith.constant 一并转换为 mydialect.constant_tensor（标量 i64/i1 常量
-// 保持 arith.constant 不变，由 target 的动态合法性保证）。
-struct ConvertArithConstant : public OpConversionPattern<arith::ConstantOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    if (!llvm::isa<RankedTensorType>(op.getType()))
-      return failure();
-    auto outTy = getTypeConverter()->convertType(op.getType());
-    if (!outTy)
-      return failure();
-    // arith.constant 的 value 是 TypedAttr；张量常量必为 ElementsAttr
+struct ConvertArithConstant : public mlir::OpRewritePattern<arith::ConstantOp> {
+  ConvertArithConstant(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(arith::ConstantOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    if (!llvm::isa<RankedTensorType>(op.getType())) return failure();
+    auto outTy = tensorTypeOrSelf(converter, op.getType());
+    if (!outTy) return failure();
     auto valueAttr = llvm::cast<ElementsAttr>(op.getValue());
-    auto newOp = rewriter.create<mydialect::ConstantTensorOp>(
-        op.getLoc(), outTy, valueAttr);
-    rewriter.replaceOp(op, newOp);
+    rewriter.replaceOpWithNewOp<mydialect::ConstantTensorOp>(op, outTy, valueAttr);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
 // ONNX.Loop -> mydialect.loop
-// 结果类型：逐个转换为 mydialect 张量；region 整体移入新算子，
-// region 内的 ONNX 操作（含终止符 ONNXLoopYieldOp）再由各自的 pattern 转换。
-struct ConvertONNXLoop : public OpConversionPattern<mlir::onnx::ONNXLoopOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXLoopOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    SmallVector<Type> outTys;
-    for (Type t : op.getResultTypes()) {
-      auto converted = getTypeConverter()->convertType(t);
-      if (!converted)
-        return failure();
+// 用 RewritePattern 而不是 OpConversionPattern——后者需要 adaptor 把 operands 通过
+// TypeConverter 转换，但 Loop 的 carry_inputs 可能是 func.func block arg（还没签名转换），
+// 导致 adaptor 构造失败（<<UNKNOWN SSA VALUE>>）。RewritePattern 直接操作原始值。
+// 简化版本：maxTripCount/cond 标量提取（从 ONNXConstant 直接取），
+// body 内所有 tensor 类型保持原样（myLoop verify 已放宽接受 tensor）。
+struct ConvertONNXLoop : public mlir::OpRewritePattern<mlir::onnx::ONNXLoopOp> {
+public:
+  using mlir::OpRewritePattern<mlir::onnx::ONNXLoopOp>::OpRewritePattern;
+  ConvertONNXLoop(mlir::MLIRContext *ctx, mlir::TypeConverter &converter)
+      : OpRewritePattern(ctx), converter(converter) {}
+
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXLoopOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    // 1. max_trip_count (tensor<i64>) → i64 标量
+    mlir::Value maxTripTensor = op.getMaxTripCount();
+    mlir::Value maxTripScalar;
+    if (auto constOp = maxTripTensor.getDefiningOp<mlir::onnx::ONNXConstantOp>()) {
+      auto attr = constOp.getValueAttr();
+      if (auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(attr))
+        maxTripScalar = rewriter.create<mlir::arith::ConstantOp>(
+            op.getLoc(), rewriter.getI64IntegerAttr((*dense.begin()).getSExtValue()));
+    }
+    if (!maxTripScalar)
+      return rewriter.notifyMatchFailure(op,
+          "max_trip_count must be ONNXConstantOp with i64 value");
+
+    // 2. cond (tensor<i1>) → i1 标量
+    mlir::Value condTensor = op.getCond();
+    mlir::Value condScalar;
+    if (auto constOp = condTensor.getDefiningOp<mlir::onnx::ONNXConstantOp>()) {
+      auto attr = constOp.getValueAttr();
+      if (auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(attr))
+        condScalar = rewriter.create<mlir::arith::ConstantOp>(
+            op.getLoc(), rewriter.getBoolAttr((*dense.begin()).getBoolValue()));
+    }
+    if (!condScalar)
+      return rewriter.notifyMatchFailure(op,
+          "initCond must be ONNXConstantOp with i1 value");
+
+    // 3. carry inputs: tensor → MyTensorType（立即 cast）
+    SmallVector<mlir::Value> convertedCarries;
+    mlir::OpBuilder builder(op);
+    for (auto v : op.getCarriedInputs()) {
+      auto targetTy = converter.convertType(v.getType());
+      if (!targetTy) return failure();
+      if (targetTy == v.getType()) {
+        convertedCarries.push_back(v);
+      } else {
+        auto cast = builder.create<mlir::UnrealizedConversionCastOp>(
+            op.getLoc(), targetTy, v);
+        convertedCarries.push_back(cast.getResult(0));
+      }
+    }
+    // result types 也转
+    SmallVector<mlir::Type> outTys;
+    for (mlir::Type t : op.getResultTypes()) {
+      auto converted = converter.convertType(t);
+      if (!converted) return failure();
       outTys.push_back(converted);
     }
-    auto newOp = rewriter.create<mydialect::LoopOp>(
-        op.getLoc(), outTys, adaptor.getMaxTripCount(), adaptor.getCond(),
-        adaptor.getCarriedInputs());
-    // 把原 ONNX body region 移入新算子（单块 region，保持原有内容）
+
+    // 4. 立即创建 mydialect::LoopOp（用 OpBuilder，不是 deferred 的 rewriter.create）
+    auto newOp = builder.create<mydialect::LoopOp>(
+        op.getLoc(), outTys, maxTripScalar, condScalar, convertedCarries);
+
+    // 5. 把 ONNX body 移入新算子
     rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
                                 newOp.getBody().end());
-    // ONNX Loop body 采用块参数（iter, cond, carries），类型用的是 builtin
-    // tensor；需按 TypeConverter 转换块参数类型，否则 region 内被转换后的
-    // mydialect 张量操作数类型会不匹配（如 add_tensor 要求 MyTensorType）。
-    if (failed(rewriter.convertRegionTypes(&newOp.getBody(),
-                                           *getTypeConverter())))
-      return failure();
+
+    // 6. body 里的 onnx.Yield → mydialect.loop_yield
+    mlir::Block &bodyBlock = newOp.getBody().front();
+    auto *oldYield = bodyBlock.getTerminator();
+    if (auto onnxYield = mlir::dyn_cast<mlir::onnx::ONNXLoopYieldOp>(oldYield)) {
+      SmallVector<mlir::Value> convertedCarryArgs;
+      for (auto carry : onnxYield.getCarryArgs()) {
+        auto targetTy = converter.convertType(carry.getType());
+        if (!targetTy) return failure();
+        if (targetTy == carry.getType()) {
+          convertedCarryArgs.push_back(carry);
+        } else {
+          mlir::OpBuilder yieldBuilder(onnxYield);
+          auto cast = yieldBuilder.create<mlir::UnrealizedConversionCastOp>(
+              op.getLoc(), targetTy, carry);
+          convertedCarryArgs.push_back(cast.getResult(0));
+        }
+      }
+      mlir::OpBuilder yieldBuilder(onnxYield);
+      yieldBuilder.create<mydialect::LoopYieldOp>(
+          op.getLoc(), onnxYield.getCond(), convertedCarryArgs);
+      onnxYield->erase();
+    }
+
     rewriter.replaceOp(op, newOp.getResults());
     return success();
   }
+
+private:
+  mlir::TypeConverter &converter;
 };
 
-// ONNX.LoopYield -> mydialect.loop_yield
+// ONNX.LoopYield -> mydialect.loop_yield（RewritePattern）
 struct ConvertONNXLoopYield
-    : public OpConversionPattern<mlir::onnx::ONNXLoopYieldOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXLoopYieldOp op,
-      OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
-    auto newOp = rewriter.create<mydialect::LoopYieldOp>(
-        op.getLoc(), adaptor.getCond(), adaptor.getCarryArgs());
-    rewriter.replaceOp(op, newOp);
+    : public mlir::OpRewritePattern<mlir::onnx::ONNXLoopYieldOp> {
+  ConvertONNXLoopYield(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXLoopYieldOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    // cond 从 0维 tensor<i1> → tensor.extract 提取 i1 标量
+    mlir::Value cond = op.getCond();
+    auto *condDefOp = cond.getDefiningOp();
+    if (auto mtt = converter.convertType(cond.getType())) {
+      if (auto mttTy = mlir::dyn_cast<mydialect::MyTensorType>(mtt)) {
+        auto cast = rewriter.create<mlir::UnrealizedConversionCastOp>(
+            op.getLoc(), mttTy, cond);
+        cond = cast.getResult(0);
+      }
+    }
+    // 如果 cond 还是 tensor 类型，做 tensor.extract 提 i1 标量
+    if (auto st = mlir::dyn_cast<mlir::ShapedType>(cond.getType())) {
+      if (st.getRank() == 0) {
+        cond = rewriter.create<mlir::tensor::ExtractOp>(op.getLoc(), cond);
+      }
+    }
+    // carry args 转换
+    SmallVector<mlir::Value> convertedCarries;
+    for (auto v : op.getCarryArgs()) {
+      convertedCarries.push_back(castIfNeeded(converter, rewriter, op.getLoc(), v));
+    }
+    rewriter.replaceOpWithNewOp<mydialect::LoopYieldOp>(op, cond, convertedCarries);
     return success();
   }
+private:
+  mlir::TypeConverter &converter;
 };
 
-struct ConvertONNXEntryPoint : public OpConversionPattern<mlir::onnx::ONNXEntryPointOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::onnx::ONNXEntryPointOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+struct ConvertONNXEntryPoint : public mlir::OpRewritePattern<mlir::onnx::ONNXEntryPointOp> {
+  using OpRewritePattern::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXEntryPointOp op,
+      mlir::PatternRewriter &rewriter) const override {
     rewriter.eraseOp(op);
     return success();
   }
@@ -342,20 +451,18 @@ struct ConvertONNXEntryPoint : public OpConversionPattern<mlir::onnx::ONNXEntryP
 namespace {
 void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
     OnnxToMyDialectTypeConverter &typeConverter) {
-  patterns.add<
-    ConvertONNXAdd,
-    ConvertONNXMul,
-    ConvertONNXEqual,
-    ConvertONNXConstant,
-    ConvertONNXIdentity,
-    ConvertONNXReshape,
-    ConvertONNXTranspose,
-    ConvertONNXReduceSum,
-    ConvertArithConstant,
-    ConvertONNXLoop,
-    ConvertONNXLoopYield,
-    ConvertONNXEntryPoint
-  >(typeConverter, patterns.getContext());
+  auto *ctx = patterns.getContext();
+  patterns.add<ConvertONNXAdd>(ctx, typeConverter);
+  patterns.add<ConvertONNXMul>(ctx, typeConverter);
+  patterns.add<ConvertONNXEqual>(ctx, typeConverter);
+  patterns.add<ConvertONNXConstant>(ctx, typeConverter);
+  patterns.add<ConvertONNXIdentity>(ctx, typeConverter);
+  patterns.add<ConvertONNXReshape>(ctx, typeConverter);
+  patterns.add<ConvertONNXTranspose>(ctx, typeConverter);
+  patterns.add<ConvertONNXReduceSum>(ctx, typeConverter);
+  patterns.add<ConvertArithConstant>(ctx, typeConverter);
+  patterns.add<ConvertONNXEntryPoint>(ctx);
+  patterns.add<ConvertONNXLoopYield>(ctx, typeConverter);
 }
 } // namespace
 
@@ -378,52 +485,110 @@ struct ConvertOnnxToMyDialectPass
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
     registry.insert<mydialect::MyDialect>();
     registry.insert<mlir::onnx::OnnxDialect>();
+    registry.insert<mlir::tensor::TensorDialect>(); // LoopYield 转换需要 tensor.extract
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OnnxToMyDialectTypeConverter typeConverter;
-    RewritePatternSet patterns(&getContext());
-    populateOnnxToMyDialectConversionPatterns(patterns, typeConverter);
 
-    ConversionTarget target(getContext());
-    // ONNX dialect 全部非法
-    target.addIllegalDialect<mlir::onnx::OnnxDialect>();
-    // 目标方言：mydialect / func / arith / builtin 合法
-    // builtin 包含 ModuleOp，必须显式合法化，否则 applyFullConversion 会因
-    // ModuleOp 未能合法化而失败
-    target.addLegalDialect<mydialect::MyDialect,
-                           func::FuncDialect,
-                           arith::ArithDialect,
-                           mlir::BuiltinDialect>();
-    // UnrealizedConversionCastOp 在函数签名转换时会自动插入（用于桥接旧/新类型）
-    // 必须显式合法化，否则整个 pattern 应用被回滚
-    target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+    // ======== Phase 1: RewritePattern 处理 ONNX Loop ========
+    RewritePatternSet preLoopPatterns(&getContext());
+    preLoopPatterns.add<ConvertONNXLoop>(&getContext(), typeConverter);
+    (void)applyPatternsAndFoldGreedily(module, std::move(preLoopPatterns));
 
-    // arith.constant 默认随 arith 方言合法；但结果类型为 ranked tensor 的常量
-    // 需转为 mydialect.constant_tensor（否则张量常量被转换后的 op 消费时会残留
-    // 无法消解的 unrealized_conversion_cast）。标量常量保持合法不变。
-    target.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
-      return !llvm::isa<RankedTensorType>(op.getType());
+    // ======== Phase 2a: 所有剩余 ONNX op → mydialect op（RewritePattern）===
+    // 全部用 RewritePattern + applyPatternsAndFoldGreedily，
+    // 不经过 dialect conversion framework（它会强制 adaptor 和 materialization，
+    // 导致 cast 套娃 + unresolved materialization 报错）。
+    // 关键：这一步完成后，Loop body 内所有 ONNX op 都被替换成 mydialect op，
+    // Loop body block arg 虽然还是 tensor 类型但已经没有 ONNX op 消费它了。
+    {
+      RewritePatternSet patterns(&getContext());
+      populateOnnxToMyDialectConversionPatterns(patterns, typeConverter);
+      (void)applyPatternsAndFoldGreedily(module, std::move(patterns));
+    }
+
+    // ======== Phase 2b: Loop body block arg 类型转换 =======================
+    // 此时 Loop body 里已经没有任何 ONNX op 了（Phase 2a 处理完），
+    // 可以安全地把 body block arg 从 tensor setType 成 MyTensorType。
+    // LoopOp 是 mydialect 合法 op，Phase 2c 的 func 签名转换不会碰它的 region。
+    module.walk([&](mydialect::LoopOp loop) {
+      mlir::Block &body = loop.getBody().front();
+      for (unsigned i = 0; i < body.getNumArguments(); ++i) {
+        mlir::BlockArgument arg = body.getArgument(i);
+        mlir::Type oldTy = arg.getType();
+        auto newTy = typeConverter.convertType(oldTy);
+        if (!newTy || newTy == oldTy) continue;
+        arg.setType(newTy);
+      }
     });
 
-    // func.func 签名合法性：当函数参数/返回类型包含 onnx builtin tensor 时
-    // 需要转换为 mydialect 张量类型
-    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
-      return typeConverter.isSignatureLegal(op.getFunctionType());
+    // ======== Phase 2c: func 签名 + return 转换（手动 walk）========
+    module.walk([&](func::FuncOp op) {
+      auto oldFnTy = op.getFunctionType();
+      SmallVector<mlir::Type> newInputTys, newResultTys;
+      for (auto t : oldFnTy.getInputs()) {
+        auto nt = typeConverter.convertType(t);
+        if (nt) newInputTys.push_back(nt);
+        else return;
+      }
+      for (auto t : oldFnTy.getResults()) {
+        auto nt = typeConverter.convertType(t);
+        if (nt) newResultTys.push_back(nt);
+        else return;
+      }
+      auto newFnTy = mlir::FunctionType::get(&getContext(), newInputTys, newResultTys);
+      op.setType(newFnTy);
+      // block arg 直接 setType（不插 cast，让 Phase 3 处理残留的 identity cast）
+      mlir::Block &entry = op.getBody().front();
+      for (unsigned i = 0; i < entry.getNumArguments(); ++i) {
+        auto newTy = newFnTy.getInput(i);
+        entry.getArgument(i).setType(newTy);
+      }
     });
-    target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
-      return typeConverter.isLegal(op.getOperandTypes());
+    module.walk([&](func::ReturnOp op) {
+      mlir::OpBuilder builder(op);
+      SmallVector<mlir::Value> newOperands;
+      for (auto v : op.getOperands()) {
+        auto targetTy = typeConverter.convertType(v.getType());
+        if (targetTy && targetTy != v.getType()) {
+          newOperands.push_back(builder.create<mlir::UnrealizedConversionCastOp>(
+              op.getLoc(), targetTy, v).getResult(0));
+        } else {
+          newOperands.push_back(v);
+        }
+      }
+      builder.create<func::ReturnOp>(op.getLoc(), newOperands);
+      op->erase();
     });
 
-    // 注册 func.func 签名转换模式（处理函数参数/返回类型转换）
-    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
-                                                                   typeConverter);
-    // 注册 func.return 操作数类型转换模式（处理函数返回值类型转换）
-    populateReturnOpTypeConversionPattern(patterns, typeConverter);
-
-    if (failed(applyFullConversion(module, target, std::move(patterns)))) {
-      signalPassFailure();
+    // ======== Phase 3: 手动消掉残留的 cast ========
+    for (int iter = 0; iter < 10; ++iter) {
+      bool changed = false;
+      SmallVector<mlir::UnrealizedConversionCastOp> toErase;
+      module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+        // identity cast: 替换 uses + erase
+        if (cast.getResult(0).getType() == cast.getOperand(0).getType()) {
+          cast.getResult(0).replaceAllUsesWith(cast.getOperand(0));
+          toErase.push_back(cast);
+          changed = true;
+          return;
+        }
+        // cast 套娃 A→B→A：替换外层 uses 为内层原操作数
+        if (auto *innerOp = cast.getOperand(0).getDefiningOp()) {
+          if (auto inner = mlir::dyn_cast_if_present<mlir::UnrealizedConversionCastOp>(innerOp)) {
+            if (inner.getOperand(0).getType() == cast.getResult(0).getType()) {
+              cast.getResult(0).replaceAllUsesWith(inner.getOperand(0));
+              toErase.push_back(cast);
+              changed = true;
+              return;
+            }
+          }
+        }
+      });
+      for (auto cast : toErase) cast->erase();
+      if (!changed) break;
     }
   }
 };

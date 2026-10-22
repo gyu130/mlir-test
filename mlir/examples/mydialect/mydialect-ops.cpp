@@ -224,6 +224,8 @@ LogicalResult LoopOp::verify() {
   if (bodyRegion.empty())
     return emitOpError("loop body region must not be empty");
   Block &bodyBlock = bodyRegion.front();
+  if (!bodyBlock.mightHaveTerminator())
+    return emitOpError("loop body must have a terminator");
   auto yieldOp = llvm::dyn_cast<LoopYieldOp>(bodyBlock.getTerminator());
   if (!yieldOp)
     return emitOpError("loop body must end with mydialect.loop_yield");
@@ -237,28 +239,48 @@ LogicalResult LoopOp::verify() {
     return emitOpError("loop results count must match initArgs count");
 
   // 3. 类型校验：yield carry 张量类型与 loop 结果类型一致
+  //    接受 MyTensorType 或 RankedTensorType（ONNX 转换时 body 里的 carry 可能
+  //    还是 builtin tensor，Phase 2 的 onnx.Add pattern 会转换它们）
+  auto getShapeElem = [](mlir::Type ty) -> std::optional<std::pair<mlir::ArrayRef<int64_t>, mlir::Type>> {
+    if (auto mtt = llvm::dyn_cast<mydialect::MyTensorType>(ty)) {
+      SmallVector<int64_t> shape;
+      for (auto a : mtt.getShape())
+        shape.push_back(mlir::cast<mlir::IntegerAttr>(a).getInt());
+      return std::make_pair(mlir::ArrayRef<int64_t>(shape), mtt.getElementType());
+    }
+    if (auto rtt = llvm::dyn_cast<mlir::RankedTensorType>(ty))
+      return std::make_pair(rtt.getShape(), rtt.getElementType());
+    return std::nullopt;
+  };
   for (auto [yieldVal, resVal] :
        llvm::zip(yieldOp.getCarryArgs(), getResults())) {
-    auto yieldTy = llvm::dyn_cast<mydialect::MyTensorType>(yieldVal.getType());
-    auto resTy = llvm::dyn_cast<mydialect::MyTensorType>(resVal.getType());
-    if (!yieldTy || !resTy)
-      return emitOpError("carry value must be mydialect tensor");
-    if (yieldTy != resTy)
-      return emitOpError(
-          "yield carry tensor type mismatch with loop result type");
+    auto ys = getShapeElem(yieldVal.getType());
+    auto rs = getShapeElem(resVal.getType());
+    if (!ys || !rs)
+      return emitOpError("carry/result must be tensor type");
+    if (ys->first != rs->first || ys->second != rs->second)
+      return emitOpError("yield carry tensor type mismatch with loop result type");
   }
   return success();
 }
 
 // ---------------- LoopYieldOp ----------------
 LogicalResult LoopYieldOp::verify() {
-  // cond 操作数必须是 i1
-  if (!getCond().getType().isInteger(1))
-    return emitOpError("cond operand must be i1");
-  // carry args 必须全部是 mydialect 张量
+  // cond：接受 i1 标量 或 0维 tensor<i1>
+  auto ty = getCond().getType();
+  bool condOk = ty.isInteger(1);
+  if (!condOk) {
+    if (auto rtt = llvm::dyn_cast<mlir::RankedTensorType>(ty))
+      condOk = (rtt.getRank() == 0 && rtt.getElementType().isInteger(1));
+    else if (auto mtt = llvm::dyn_cast<mydialect::MyTensorType>(ty))
+      condOk = (mtt.getShape().empty() && mtt.getElementType().isInteger(1));
+  }
+  if (!condOk)
+    return emitOpError("cond operand must be i1 or 0-d tensor<i1>");
+  // carry args：接受 MyTensorType 或 RankedTensorType
   for (auto carry : getCarryArgs()) {
-    if (!llvm::dyn_cast<mydialect::MyTensorType>(carry.getType()))
-      return emitOpError("carry argument must be mydialect tensor");
+    if (!llvm::isa<mydialect::MyTensorType, mlir::RankedTensorType>(carry.getType()))
+      return emitOpError("carry argument must be tensor type");
   }
   return success();
 }

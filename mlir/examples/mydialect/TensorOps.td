@@ -146,25 +146,25 @@ def LoopOp : Op<MyDialect, "loop", [
   let arguments = (ins
     I64:$maxTripCount,               // 最大迭代次数，标量 i64
     I1:$initCond,                    // 初始条件，标量 i1
-    Variadic<MyTensorType>:$initArgs // 迭代 carry 初始张量参数
+    Variadic<MyTensorType>:$initArgs
   );
   let results = (outs
     Variadic<MyTensorType>:$results
   );
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
-  // 汇编格式：mydialect.loop %m, %cond, %a, %b : (tensor...) -> (tensor...) { ... }
   let assemblyFormat = "$maxTripCount `,` $initCond `,` $initArgs attr-dict `:` type($initArgs) `->` type($results) $body";
 }
 
 // 循环体终止算子 loop_yield，产出 (newCond, newCarryArgs)
+// cond 可以是 i1 标量 或 0维 tensor<i1>（ONNX 转换时 body 里可能是 tensor<i1> 或 MyTensorType<[],i1>）
 def LoopYieldOp : Op<MyDialect, "loop_yield", [
   Pure,
   Terminator,
   ParentOneOf<["LoopOp"]>
 ]> {
   let arguments = (ins
-    I1:$cond,
+    AnyType:$cond,
     Variadic<MyTensorType>:$carryArgs
   );
   let results = (outs);

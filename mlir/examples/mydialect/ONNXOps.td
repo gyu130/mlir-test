@@ -49,14 +49,15 @@ def ONNXEqualOp : Op<OnnxDialect, "Equal", [
 }
 
 // ONNX Constant: ElementsAttr -> output
-// 注意：不加 ConstantLike trait，否则 conversion framework 在尝试 fold 该 op 时
-// 会触发 assertion（ConstantLike 要求 fold 必须成功，但本 stub 未实现 fold）。
+// 用 hasCustomAssemblyFormat=1 自己写 parser，绕过 ODS assemblyFormat 强制 attr-dict 的限制。
+// onnx-mlir 输出不带额外属性（没有 onnx_node_name 等），而 ODS attr-dict 指令在 op 没有
+// 其他 attribute 时会强制期待 `{}` 或内联属性，导致 "expected ':'" 解析错误。
 def ONNXConstantOp : Op<OnnxDialect, "Constant", [
   Pure
 ]> {
   let arguments = (ins ElementsAttr:$value);
   let results = (outs AnyTensor:$output);
-  let assemblyFormat = "$value attr-dict `:` type($output)";
+  let hasCustomAssemblyFormat = 1;
 }
 
 // ONNX Identity: input -> output
@@ -98,30 +99,30 @@ def ONNXReduceSumOp : Op<OnnxDialect, "ReduceSum", [Pure]> {
 // 终止符 mnemonic 用 "Yield"（即 onnx.Yield），与真实 onnx-mlir 命名一致。
 // ONNX Loop 的 body 采用块参数形式（iter, cond, carries），
 // 测试可用通用形式 "onnx.Loop" ... ({ ^bb0(...): ... })。
+// onnx.Yield：onns-mlir 的 ONNX Loop body 里所有值（cond + carries）
+// 都是 tensor 类型，所以 $cond 也必须是 AnyTensor。
 def ONNXLoopYieldOp : Op<OnnxDialect, "Yield", [
   Pure,
-  Terminator,
-  ParentOneOf<["ONNXLoopOp"]>
+  Terminator
 ]> {
-  let arguments = (ins I1:$cond, Variadic<AnyTensor>:$carryArgs);
+  let arguments = (ins AnyTensor:$cond, Variadic<AnyTensor>:$carryArgs);
   let results = (outs);
-  let assemblyFormat = "$cond `,` $carryArgs attr-dict `:` type($cond) `,` type($carryArgs)";
+  let assemblyFormat = "attr-dict $cond `,` $carryArgs `:` type($cond) `,` type($carryArgs)";
 }
 
-// 同 mydialect::LoopOp：SingleBlockImplicitTerminator 不可用（终止符 cond 必需），
-// 使用 SingleBlock，终止符在 IR 中显式书写。
+// ONNX Loop：max_trip_count + cond + carries 输入都是 tensor。
+// onnx-mlir 对 ONNX Loop 用泛型格式（有 region），所以 assemblyFormat 不影响解析。
 def ONNXLoopOp : Op<OnnxDialect, "Loop", [
   Pure,
   SingleBlock
 ]> {
   let arguments = (ins
-    I64:$max_trip_count,
-    I1:$cond,
+    AnyTensor:$max_trip_count,
+    AnyTensor:$cond,
     Variadic<AnyTensor>:$carried_inputs
   );
   let results = (outs Variadic<AnyTensor>:$outputs);
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = "$max_trip_count `,` $cond `,` $carried_inputs attr-dict `:` type($carried_inputs) `->` type($outputs) $body";
 }
 
 // onnx-mlir 生成的入口标记：generic 语法以 properties 形式携带 func 符号引用

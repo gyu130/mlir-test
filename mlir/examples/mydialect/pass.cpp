@@ -778,10 +778,22 @@ struct LoopOpLowering : public mlir::OpConversionPattern<mydialect::LoopOp> {
                                    beforeBlock->getArguments());
 
     // ---- after 块：inline 原循环体 ----
+    // inline 之前先检查 yield 的 cond 是否直接透传 body block arg：
+    // ConversionPatternRewriter 的块参数替换是延迟生效的，inline 后再查
+    // yieldOp.getCond() 拿到的仍是旧 block arg（MyTensor 类型），framework 收尾
+    // 时会反插 i1->MyTensor 的 materialization，与 ensureConverted 的
+    // MyTensor->memref cast 连成两端类型不同的链，无法被 canonicalize 折叠。
+    mlir::Block *srcBody = &op.getBody().front();
+    auto srcYield =
+        llvm::cast<mydialect::LoopYieldOp>(srcBody->getTerminator());
+    int condBlockArgIdx = -1;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(srcYield.getCond()))
+      if (barg.getOwner() == srcBody)
+        condBlockArgIdx = barg.getArgNumber();
+
     mlir::Block *afterBlock = whileOp.getAfterBody();
     llvm::SmallVector<mlir::Value> replacements(afterBlock->getArguments().begin(),
                                                 afterBlock->getArguments().end());
-    mlir::Block *srcBody = &op.getBody().front();
     rewriter.inlineBlockBefore(srcBody, afterBlock, afterBlock->end(),
                                replacements);
 
@@ -795,7 +807,27 @@ struct LoopOpLowering : public mlir::OpConversionPattern<mydialect::LoopOp> {
         afterBlock->getArgument(0), oneI64.getResult());
     llvm::SmallVector<mlir::Value> yieldVals;
     yieldVals.push_back(nextI.getResult());
-    yieldVals.push_back(yieldOp.getCond());
+    // cond 必须是 i1 标量。ONNX 转换来的 body 里 cond 常是 0 维张量，分两种情况：
+    //   1. cond 直接透传 body block arg（inline 前已记录位置）——after 块同位置
+    //      的参数就是 while 携带的 i1 标量，直接使用；
+    //   2. body 内真实算出的 0 维张量（如 cmpi_tensor）——转 memref 后 load 出 i1，
+    //      该 cast 会在上游 op 转换完成后被 framework 消解。
+    mlir::Value condI1;
+    if (condBlockArgIdx >= 0 &&
+        afterBlock->getArgument(condBlockArgIdx).getType().isInteger(1)) {
+      condI1 = afterBlock->getArgument(condBlockArgIdx);
+    } else {
+      mlir::Value v = yieldOp.getCond();
+      if (v.getType().isInteger(1)) {
+        condI1 = v;
+      } else {
+        mlir::Value mv = ensureConverted(v); // 0-d tensor -> memref<i1>
+        condI1 = rewriter.create<mlir::memref::LoadOp>(loc, mv,
+                                                       mlir::ValueRange{})
+                     .getResult();
+      }
+    }
+    yieldVals.push_back(condI1);
     // carry 值必须转成 memref：若上游（如 add_tensor）尚未转换，
     // 直接用旧值会让 scf.yield 操作数残留 tensor 类型，与 before 块参数不匹配
     for (auto v : yieldOp.getCarryArgs())
