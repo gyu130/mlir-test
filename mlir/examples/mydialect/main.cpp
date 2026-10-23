@@ -1,6 +1,9 @@
 #include "MyDialect.h"
 #include "pass.h"
 #include "MyOptPass.h"
+#include "SimpleCParser.h"
+#include "ONNXToMyDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
@@ -18,6 +21,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
@@ -150,44 +154,87 @@ extern "C" void my_runtime_print_string(const char* s) {
   fflush(stdout);
 }
 
+static llvm::cl::opt<std::string> parseCInput(
+    "parse-c",
+    llvm::cl::desc("Parse simple C source file and generate MyDialect MLIR"),
+    llvm::cl::value_desc("filename")
+);
+
+static llvm::cl::opt<std::string> parseMLIRInput(
+    "parse-mlir",
+    llvm::cl::desc("Load MyDialect MLIR file"),
+    llvm::cl::value_desc("filename")
+);
+
+// 位置参数：<mlir-file> [intval|funcname] [funcname]
+// 必须注册位置选项：cl 在没有 positional 选项时遇到任何位置参数
+// 都会报 "Too many positional arguments" 并退出，位置参数模式会失效
+static llvm::cl::list<std::string> positionalArgs(
+    llvm::cl::Positional,
+    llvm::cl::desc("<mlir-file> [intval|funcname] [funcname]"),
+    llvm::cl::ZeroOrMore
+);
 
 int main(int argc, char** argv) {
-  // 用法：
-  //   ./mydriver file.mlir                    # 入口默认 main（缺省取第一个 func）
-  //   ./mydriver file.mlir <intval>           # 整型标量参数取 intval
-  //   ./mydriver file.mlir <funcname>         # 指定入口函数名
-  //   ./mydriver file.mlir <intval> <funcname>
-  if (argc < 2 || argc > 4) {
-    llvm::errs() << "Usage:\n"
-                 << argv[0] << " <mlir-file> [intval] [funcname]\n";
+  llvm::cl::ParseCommandLineOptions(argc, argv);
+
+  if (!parseCInput.empty() && !parseMLIRInput.empty()) {
+    llvm::errs() << "Error: cannot use --parse-c and --parse-mlir together\n";
     return 1;
   }
-  std::string mlirFilePath = argv[1];
-  std::optional<int64_t> cliArg;
-  std::string entryName = "main";
-  bool entryNameExplicit = false;
-  if (argc >= 3) {
-    llvm::StringRef a2(argv[2]);
-    bool negative = a2.starts_with("-");
-    bool isNum = !a2.empty() &&
-                 llvm::all_of(a2.drop_front(negative ? 1 : 0),
-                              [](char c) { return c >= '0' && c <= '9'; }) &&
-                 (negative ? a2.size() > 1 : true);
-    if (isNum) cliArg = atoll(argv[2]);
-    else { entryName = argv[2]; entryNameExplicit = true; }
-  }
-  if (argc >= 4) {
-    entryName = argv[3];
-    entryNameExplicit = true;
+
+  if (!parseCInput.empty()) {
+    if (!positionalArgs.empty()) {
+      llvm::errs() << "Error: --parse-c does not take positional arguments\n";
+      return 1;
+    }
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> bufOrErr =
+        llvm::MemoryBuffer::getFile(parseCInput);
+    if (!bufOrErr) {
+      llvm::errs() << "Cannot open C file: " << parseCInput << "\n";
+      return 1;
+    }
+    std::string src = bufOrErr.get()->getBuffer().str();
+
+    mlir::DialectRegistry registry;
+    registry.insert<mydialect::MyDialect>();
+    registry.insert<mlir::func::FuncDialect>();
+    registry.insert<mlir::arith::ArithDialect>();
+
+    mlir::MLIRContext ctx(registry);
+    ctx.loadDialect<mydialect::MyDialect>();
+    ctx.loadDialect<mlir::func::FuncDialect>();
+    ctx.loadDialect<mlir::arith::ArithDialect>();
+
+    mlir::OpBuilder builder(&ctx);
+    mlir::ModuleOp module = mlir::ModuleOp::create(builder.getUnknownLoc());
+
+    mydialect::SimpleCParser parser(builder, module);
+    if (mlir::failed(parser.parse(src))) {
+      llvm::errs() << "Simple C parse failed!\n";
+      return 1;
+    }
+
+    // 横幅走 stderr，IR 走 stdout：`--parse-c x.c > x.mlir` 重定向得到
+    // 的文件只含可回读的 MLIR 文本（dump() 固定打印到 stderr，不能用）
+    llvm::errs() << "===== Generated MyDialect IR from C =====\n";
+    module->print(llvm::outs());
+    llvm::outs() << "\n";
+    return 0;
   }
 
-  
+  // ========= MLIR 输入模式：--parse-mlir <file> 或 位置参数 <file> =========
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
   llvm::InitializeNativeTargetAsmParser();
 
   mlir::DialectRegistry registry;
   mlir::arith::registerConvertArithToLLVMInterface(registry);
+  // tensor 方言构造时会级联加载 complex 方言（upstream 行为），
+  // 而 complex 声明了 ConvertToLLVMPatternInterface 的 promise；
+  // 不注册其实现扩展的话，convert-to-llvm pass 遍历已加载方言时
+  // 会触发 "promised by dialect 'complex' but never implemented" 致命错误
+  mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
@@ -197,6 +244,10 @@ int main(int argc, char** argv) {
 
   registry.insert<mlir::scf::SCFDialect>();
   registry.insert<mlir::memref::MemRefDialect>();
+  // onnx 输入文件（如 loop_test.mlir）解析需要 onnx 方言；
+  // onnx.LoopYield 转换会生成 tensor.extract，需要 tensor 方言
+  registry.insert<mlir::onnx::OnnxDialect>();
+  registry.insert<mlir::tensor::TensorDialect>();
 
   mlir::MLIRContext ctx(registry);
   ctx.loadDialect<mydialect::MyDialect>();
@@ -206,15 +257,63 @@ int main(int argc, char** argv) {
   ctx.loadDialect<mlir::memref::MemRefDialect>();
   ctx.loadDialect<mlir::affine::AffineDialect>();
 
+  // ========= 确定输入文件与可选附加参数（intval / funcname）=========
+  std::string mlirFilePath;
+  size_t extraIdx = 0; // positionalArgs 中第一个附加参数的下标
+  if (!parseMLIRInput.empty()) {
+    mlirFilePath = parseMLIRInput;
+  } else if (!positionalArgs.empty()) {
+    mlirFilePath = positionalArgs[0];
+    extraIdx = 1;
+  } else {
+    llvm::errs() << "Usage:\n"
+                 << argv[0] << " <mlir-file> [intval] [funcname]\n"
+                 << argv[0] << " --parse-mlir <mlir-file> [intval|funcname] [funcname]\n"
+                 << argv[0] << " --parse-c <c-file>\n";
+    return 1;
+  }
 
-  auto module = mlir::parseSourceFile<mlir::ModuleOp>(argv[1], &ctx);
+  std::optional<int64_t> cliArg;
+  std::string entryName = "main";
+  bool entryNameExplicit = false;
+  for (size_t i = extraIdx; i < positionalArgs.size(); ++i) {
+    llvm::StringRef a(positionalArgs[i]);
+    bool negative = a.starts_with("-");
+    bool isNum = !a.empty() &&
+                 llvm::all_of(a.drop_front(negative ? 1 : 0),
+                              [](char c) { return c >= '0' && c <= '9'; }) &&
+                 (negative ? a.size() > 1 : true);
+    if (isNum && !cliArg.has_value()) {
+      cliArg = atoll(positionalArgs[i].c_str());
+    } else if (!isNum && !entryNameExplicit) {
+      entryName = positionalArgs[i];
+      entryNameExplicit = true;
+    } else {
+      llvm::errs() << "Error: too many or conflicting extra arguments\n";
+      return 1;
+    }
+  }
+
+  auto module = mlir::parseSourceFile<mlir::ModuleOp>(mlirFilePath, &ctx);
   if (!module) {
     llvm::errs() << "parse mlir file failed\n";
     return 1;
   }
 
-  llvm::outs() << "===== parsed IR dump =====\n";
+  llvm::errs() << "===== parsed IR dump =====\n";
   module->dump();
+
+  // ========= 含 ONNX op 的输入先转 mydialect（无 onnx op 时为 no-op）=========
+  // 必须在捕获入口签名之前完成：ONNX 转换会把入口签名的 builtin tensor
+  // 改写成 MyTensorType，captureSignature 只识别 MyTensorType/memref/标量
+  {
+    mlir::PassManager onnxPM(&ctx);
+    onnxPM.addPass(mlir::createConvertONNXToMyDialectPass());
+    if (mlir::failed(onnxPM.run(module.get()))) {
+      llvm::errs() << "ONNX to MyDialect conversion failed\n";
+      return 1;
+    }
+  }
 
   // ========= 确定入口函数并在 lowering 前捕获原始签名 =========
   auto entryFunc = module->lookupSymbol<mlir::func::FuncOp>(entryName);
@@ -258,7 +357,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  llvm::outs() << "===== lowered IR dump =====\n";
+  llvm::errs() << "===== lowered IR dump =====\n";
   module->dump();
 
   // 创建ExecutionEngine

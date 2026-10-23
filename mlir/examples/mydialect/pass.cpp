@@ -720,6 +720,67 @@ struct AddTensorOpLowering
   }
 };
 
+// ============ MulTensorOp: mydialect.mul_tensor → memref 逐元素乘法 ============
+// 与 AddTensorOpLowering 同构（C 前端 7*6 与 ONNX Mul 都会产生 mul_tensor）：
+// adaptor 操作数已是 memref；0 维张量无循环直接 load/mul/store，
+// 多维张量按静态 shape 生成嵌套 scf.for
+struct MulTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::MulTensorOp> {
+  using mlir::OpConversionPattern<mydialect::MulTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::MulTensorOp op, mydialect::MulTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        getTypeConverter()->convertType(op.getRes().getType()));
+
+    // 防御：上游 op 未转换时 adaptor 可能仍是 MyTensorType，补 cast 到 memref
+    auto ensureMemref = [&](mlir::Value v) -> mlir::Value {
+      if (mlir::isa<mlir::MemRefType>(v.getType()))
+        return v;
+      return rewriter
+          .create<mlir::UnrealizedConversionCastOp>(
+              loc, getTypeConverter()->convertType(v.getType()), v)
+          .getResult(0);
+    };
+    mlir::Value lhs = ensureMemref(adaptor.getLhs());
+    mlir::Value rhs = ensureMemref(adaptor.getRhs());
+
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    mlir::Type elemTy = resTy.getElementType();
+
+    // 在指定索引处生成 load lhs/rhs、相乘、store 到 res
+    auto emitElementwise = [&](mlir::ValueRange idxs) {
+      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
+      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
+      mlir::Value prod;
+      if (mlir::isa<mlir::IntegerType>(elemTy))
+        prod = mlir::arith::MulIOp::create(rewriter, loc, lv, rv);
+      else
+        prod = mlir::arith::MulFOp::create(rewriter, loc, lv, rv);
+      rewriter.create<mlir::memref::StoreOp>(loc, prod, res, idxs);
+    };
+
+    if (resTy.getRank() == 0) {
+      emitElementwise(mlir::ValueRange{});
+    } else {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      llvm::SmallVector<mlir::Value, 4> ivs;
+      for (int64_t d : resTy.getShape()) {
+        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
+        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
+        ivs.push_back(loop.getInductionVar());
+        rewriter.setInsertionPointToStart(loop.getBody());
+      }
+      emitElementwise(ivs);
+    }
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
 // ============ LoopOp: mydialect.loop → scf.while ============
 // 对标 ONNX Loop 语义：cond && (i < maxTrip) 时执行循环体，
 // 循环体产出 (newCond, newCarries)。
@@ -861,6 +922,7 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
 	MyStoreToMemRef,
 	ConstantTensorOpLowering,
 	AddTensorOpLowering,
+	MulTensorOpLowering,
 	LoopOpLowering>(converter, patterns.getContext());
 }
 

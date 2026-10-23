@@ -51,6 +51,7 @@ add_library(MyDialectLib
   MyOptPass.cpp
   ONNXToMyDialect.cpp
   mydialect-ops.cpp
+  SimpleCParser.cpp
 )
 add_dependencies(MyDialectLib MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen)
 llvm_process_sources(MyDialectLib PARTIAL_SOURCES_INTENDED)
@@ -99,6 +100,8 @@ target_link_libraries(mydriver
     MLIRControlFlowToLLVM
     MLIRMemRefToLLVM
     MLIRUBToLLVM
+    MLIRTensorDialect
+    MLIRComplexToLLVM
     MLIRBuiltinToLLVMIRTranslation
     LLVMX86AsmParser
 )

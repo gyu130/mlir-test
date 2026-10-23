@@ -106,8 +106,13 @@ void mydialect::MyTensorType::print(mlir::AsmPrinter &printer) const {
   //   - op 汇编 stripped 路径：printStrippedAttrOrType 直接调用本方法，
   //     输出 <[...], i32>，解析时 parseCustomTypeWithFallback 直接调用
   //     MyTensorType::parse 解析类型体（两条路径共用同一份 parse）。
-  printer << "<[";
   auto shapeAttr = getShape();
+  if (!shapeAttr) {
+    printer << "<invalid-shape>, " << getElementType() << ">";
+    return;
+  }
+
+  printer << "<[";
   for (size_t i = 0; i < shapeAttr.size(); i++) {
     if (i > 0) printer << ",";
     auto intAttr = mlir::cast<mlir::IntegerAttr>(shapeAttr[i]);

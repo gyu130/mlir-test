@@ -138,6 +138,7 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::LoopYieldOp>();
     target.addIllegalOp<mydialect::ConstantTensorOp>();
     target.addIllegalOp<mydialect::AddTensorOp>();
+    target.addIllegalOp<mydialect::MulTensorOp>();
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addLegalDialect<mlir::arith::ArithDialect>();
