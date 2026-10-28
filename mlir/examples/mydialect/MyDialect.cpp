@@ -517,6 +517,11 @@ void DivSIOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
 } // namespace mydialect
 
 namespace mydialect {
+// 同时 define DECL + DEF + REGISTRATION：让 TableGen 生成所有 pass 的
+// 声明、定义和注册代码。GEN_PASS_REGISTRATION 只生成注册函数，
+// 但注册函数内部调用 create*Pass() 需要 DECL + DEF 先存在。
+#define GEN_PASS_DECL
+#define GEN_PASS_DEF
 #define GEN_PASS_REGISTRATION
 #include "MyDialectPasses.h.inc"
 

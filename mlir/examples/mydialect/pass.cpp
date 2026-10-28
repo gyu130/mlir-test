@@ -902,6 +902,49 @@ struct LoopOpLowering : public mlir::OpConversionPattern<mydialect::LoopOp> {
   }
 };
 
+// ========== TensorToScalarOpLowering: MyTensorType(0维) → i32 ==========
+// SimpleCParser 桥接 op，MyTensorType 经 converter 转 memref<i32>（0维），
+// 用 memref.load 取出标量。
+struct TensorToScalarOpLowering
+    : public mlir::OpConversionPattern<mydialect::TensorToScalarOp> {
+  using OpConversionPattern<mydialect::TensorToScalarOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::TensorToScalarOp op,
+      typename mydialect::TensorToScalarOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    // adaptor.getInput() 已经是 converter 处理后的 memref<i32>（0维）
+    // 0 维 memref.load 不需要 index
+    auto load = rewriter.create<mlir::memref::LoadOp>(
+        op.getLoc(), adaptor.getInput(), mlir::ValueRange{});
+    rewriter.replaceOp(op, load.getResult());
+    return mlir::success();
+  }
+};
+
+// ========== ScalarToTensorOpLowering: i32 → MyTensorType(0维) ==========
+// 桥接 op，result 经 converter 转 memref<i32>，用 memref.alloc + store 实现。
+struct ScalarToTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::ScalarToTensorOp> {
+  using OpConversionPattern<mydialect::ScalarToTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::ScalarToTensorOp op,
+      typename mydialect::ScalarToTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto convertedTy = getTypeConverter()->convertType(op.getOutput().getType());
+    if (!convertedTy) {
+      return mlir::failure();
+    }
+    auto memrefTy = mlir::cast<mlir::MemRefType>(convertedTy);
+    auto loc = op.getLoc();
+    // 0 维 memref.alloc 不需要 dynamic sizes
+    auto alloc = rewriter.create<mlir::memref::AllocOp>(loc, memrefTy);
+    rewriter.create<mlir::memref::StoreOp>(
+        loc, adaptor.getInput(), alloc.getResult(), mlir::ValueRange{});
+    rewriter.replaceOp(op, alloc.getResult());
+    return mlir::success();
+  }
+};
+
 } // anonymous namespace
 
 namespace mydialect {
@@ -923,7 +966,9 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
 	ConstantTensorOpLowering,
 	AddTensorOpLowering,
 	MulTensorOpLowering,
-	LoopOpLowering>(converter, patterns.getContext());
+	LoopOpLowering,
+	TensorToScalarOpLowering,
+	ScalarToTensorOpLowering>(converter, patterns.getContext());
 }
 
 void registerConstantFoldMyDialectPass() {

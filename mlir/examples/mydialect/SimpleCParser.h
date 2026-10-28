@@ -14,7 +14,7 @@ enum class TokenKind {
   IntKw, MainKw, PrintKw, ReturnKw,
   Ident, Number,
   Plus, Minus, Mul, Div,
-  LParen, RParen, LBrace, RBrace, Semi, Eq
+  LParen, RParen, LBrace, RBrace, Semi, Eq, Comma
 };
 
 struct Token {

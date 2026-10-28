@@ -58,6 +58,26 @@ def WrapOp : Op<MyDialect, "wrap"> {
 // 【类型约束】用于 Op 定义中类型检查
 def WrappedI32TypeConstraint : Type<CPred<"$_self.isa<::mydialect::WrappedI32Type>()">, "wrapped_i32 type">;
 
+// ======== Scalar ↔ Tensor 转换 op ========
+// SimpleCParser 全程用 MyTensorType 做标量载体，而 hw_mul 是纯标量 op。
+// 这两个 op 让两个世界可以无缝互转。
+// 注意：MyTensorType 是自定义 TypeDef，在 ODS 里不能作为 operand/result
+// 直接声明（ODS 需要 "buildable" type），这里用 AnyType + assemblyFormat
+// 指令手动指定类型。
+def ScalarToTensorOp : Op<MyDialect, "scalar_to_tensor"> {
+  let summary = "Wrap scalar i32 to 0-dim mydialect tensor";
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$output);
+  let assemblyFormat = "$input attr-dict `:` type($input) `,` type($output)";
+}
+
+def TensorToScalarOp : Op<MyDialect, "tensor_to_scalar"> {
+  let summary = "Extract scalar i32 from 0-dim mydialect tensor";
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$output);
+  let assemblyFormat = "$input attr-dict `:` type($input) `,` type($output)";
+}
+
 def PrintOp : Op<MyDialect, "print"> {
   let summary = "Print integer value op";
   let description = "Print an integer value to stdout";
@@ -182,6 +202,11 @@ def StoreOp : Op<MyDialect, "store"> {
 }
 
 include "TensorOps.td"
+
+// Hardware accelerator ops (hw_mul). Independent td file to keep HW-specific
+// ops separate from general-purpose dialect ops, but included here so that
+// HwMulOp is generated into mydialect-opdefs.h.inc alongside all other ops.
+include "MyDialectHwOps.td"
 
 #endif
 

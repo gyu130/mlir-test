@@ -4,6 +4,8 @@
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <cctype>
@@ -51,6 +53,7 @@ Token SimpleCParser::nextToken() {
     case '{': pos++; t.kind = TokenKind::LBrace; t.str = "{"; break;
     case '}': pos++; t.kind = TokenKind::RBrace; t.str = "}"; break;
     case ';': pos++; t.kind = TokenKind::Semi; t.str = ";"; break;
+    case ',': pos++; t.kind = TokenKind::Comma; t.str = ","; break;
     case '=': pos++; t.kind = TokenKind::Eq; t.str = "="; break;
     default:
       t.kind = TokenKind::Eof;
@@ -117,10 +120,7 @@ LogicalResult SimpleCParser::parseFunc() {
   // 创建 func.func @main_graph() -> MyTensorType<i32>
   // 注意：shape 参数必须显式传空 ArrayAttr；直接写 {} 会 value-initialize
   // 出 null ArrayAttr，打印时触发 MyTensorType::print 的 invalid-shape 分支
-  auto shapeAttr = mlir::ArrayAttr::get(builder.getContext(), {});
-  auto retTy = MyTensorType::get(builder.getContext(), shapeAttr,
-                                 builder.getI32Type());
-  auto funcTy = FunctionType::get(builder.getContext(), {}, {retTy});
+  auto funcTy = FunctionType::get(builder.getContext(), {}, {});
   auto func = func::FuncOp::create(builder.getUnknownLoc(), "main_graph", funcTy);
   module.push_back(func);
   Block *entry = func.addEntryBlock();
@@ -130,6 +130,9 @@ LogicalResult SimpleCParser::parseFunc() {
     if (failed(parseStmt(entry))) return failure();
   }
   if (!expect(TokenKind::RBrace)) return failure();
+
+  // main 函数末尾必须有 func.return terminator
+  builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
   return success();
 }
 
@@ -196,6 +199,7 @@ LogicalResult SimpleCParser::parseCall(Block *block) {
     llvm::errs() << "expect ';' after print\n";
     return failure();
   }
+
   builder.create<PrintOp>(builder.getUnknownLoc(), arg);
   return success();
 }
@@ -240,6 +244,45 @@ Value SimpleCParser::parsePrimary() {
   } else if (curTok.kind == TokenKind::Ident) {
     std::string nm = curTok.str;
     consume();
+
+    // hw_mul(a, b) —— 硬件乘法表达式
+    // SimpleCParser 全程用 MyTensorType，HwMulOp 是纯标量 op。
+    // 用 TensorToScalarOp 提取 → HwMulOp → ScalarToTensorOp wrap。
+    if (nm == "hw_mul" && curTok.kind == TokenKind::LParen) {
+      consume(); // (
+      Value lhs = parseExpr();
+      if (!expect(TokenKind::Comma)) {
+        llvm::errs() << "hw_mul: expected ',' between operands\n";
+        return nullptr;
+      }
+      Value rhs = parseExpr();
+      if (!expect(TokenKind::RParen)) {
+        llvm::errs() << "hw_mul: expected ')'\n";
+        return nullptr;
+      }
+
+      mlir::ImplicitLocOpBuilder ilb(builder.getUnknownLoc(), builder);
+      auto shapeAttr = mlir::ArrayAttr::get(builder.getContext(), {});
+      auto tensorTy = mydialect::MyTensorType::get(builder.getContext(), shapeAttr,
+                                                    builder.getI32Type());
+
+      // TensorToScalarOp: MyTensorType → i32（显式传 result=i32）
+      auto lhsI32 = ilb.create<mydialect::TensorToScalarOp>(
+          builder.getI32Type(), lhs);
+      auto rhsI32 = ilb.create<mydialect::TensorToScalarOp>(
+          builder.getI32Type(), rhs);
+
+      // HwMulOp: i32 × i32 → i32
+      auto hwMulOp = mydialect::HwMulOp::create(ilb, ilb.getI32Type(),
+                                                  lhsI32.getResult(),
+                                                  rhsI32.getResult());
+
+      // ScalarToTensorOp: i32 → MyTensorType（显式传 result=MyTensorType）
+      auto wrapOp = ilb.create<mydialect::ScalarToTensorOp>(
+          tensorTy, hwMulOp.getResult());
+      return wrapOp.getResult();
+    }
+
     auto it = symTable.find(nm);
     if (it == symTable.end()) {
       llvm::errs() << "undefined var " << nm << "\n";

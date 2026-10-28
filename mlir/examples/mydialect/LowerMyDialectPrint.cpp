@@ -139,6 +139,10 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::ConstantTensorOp>();
     target.addIllegalOp<mydialect::AddTensorOp>();
     target.addIllegalOp<mydialect::MulTensorOp>();
+    // SimpleCParser 桥接 op：由 pass.cpp 里的 TensorToScalarOpLowering /
+    // ScalarToTensorOpLowering 转成 memref.load / memref.alloc+store
+    target.addIllegalOp<mydialect::TensorToScalarOp>();
+    target.addIllegalOp<mydialect::ScalarToTensorOp>();
     target.addLegalDialect<mlir::func::FuncDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addLegalDialect<mlir::arith::ArithDialect>();

@@ -3,6 +3,7 @@
 #include "MyOptPass.h"
 #include "SimpleCParser.h"
 #include "ONNXToMyDialect.h"
+#include "LowerHwMulPass.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -166,6 +167,11 @@ static llvm::cl::opt<std::string> parseMLIRInput(
     llvm::cl::value_desc("filename")
 );
 
+static llvm::cl::opt<bool> hwLowerMode(
+    "hw-lower",
+    llvm::cl::desc("Select hw_mul lowering path: true=llvm intrinsic, false=arith.muli"),
+    llvm::cl::init(false));
+
 // 位置参数：<mlir-file> [intval|funcname] [funcname]
 // 必须注册位置选项：cl 在没有 positional 选项时遇到任何位置参数
 // 都会报 "Too many positional arguments" 并退出，位置参数模式会失效
@@ -200,11 +206,13 @@ int main(int argc, char** argv) {
     registry.insert<mydialect::MyDialect>();
     registry.insert<mlir::func::FuncDialect>();
     registry.insert<mlir::arith::ArithDialect>();
+    registry.insert<mlir::tensor::TensorDialect>();
 
     mlir::MLIRContext ctx(registry);
     ctx.loadDialect<mydialect::MyDialect>();
     ctx.loadDialect<mlir::func::FuncDialect>();
     ctx.loadDialect<mlir::arith::ArithDialect>();
+    ctx.loadDialect<mlir::tensor::TensorDialect>();
 
     mlir::OpBuilder builder(&ctx);
     mlir::ModuleOp module = mlir::ModuleOp::create(builder.getUnknownLoc());
@@ -345,6 +353,10 @@ int main(int argc, char** argv) {
   mlir::PassManager optPM(&ctx);
   optPM.addPass(mydialect::createMyOptPass()); // 高层优化Pass
   optPM.addPass(mydialect::createConstantFoldMyDialectPass());
+  // LowerHwMulPass 必须在 LowerMyDialectPrint 之前：hw_mul 先 lower 成
+  // arith.muli / llvm.intrinsic，然后 LowerMyDialectPrint 处理剩下的
+  // tensor_to_scalar / scalar_to_tensor（SimpleCParser 生成的桥接 op）
+  optPM.addPass(mydialect::createLowerHwMulPass(hwLowerMode.getValue()));
   optPM.addPass(mydialect::createLowerMyDialectPrint());
   optPM.addPass(mlir::createCanonicalizerPass());
   // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）

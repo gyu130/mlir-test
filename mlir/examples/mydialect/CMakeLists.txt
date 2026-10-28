@@ -13,7 +13,7 @@ include(HandleLLVMOptions)
 #include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
 
 set(LLVM_TARGET_DEFINITIONS mydialect.td)
-set(ADDITIONAL_TABLEGEN_DEPENDS TensorOps.td)
+set(ADDITIONAL_TABLEGEN_DEPENDS TensorOps.td MyDialectHwOps.td)
 mlir_tablegen(mydialect.h.inc -gen-dialect-decls -dialect=mydialect DEPENDS ${ADDITIONAL_TABLEGEN_DEPENDS})
 mlir_tablegen(mydialect.cpp.inc -gen-dialect-defs -dialect=mydialect DEPENDS ${ADDITIONAL_TABLEGEN_DEPENDS})
 mlir_tablegen(mydialect-opdefs.h.inc -gen-op-decls DEPENDS ${ADDITIONAL_TABLEGEN_DEPENDS})
@@ -43,6 +43,12 @@ set(LLVM_TARGET_DEFINITIONS MyOptPass.td)
 mlir_tablegen(MyOptPass.h.inc -gen-pass-decls)
 add_public_tablegen_target(MyOptPassTableGen)
 
+unset(LLVM_TARGET_DEFINITIONS)
+set(LLVM_TARGET_DEFINITIONS MyDialectHwOps.td)
+mlir_tablegen(MyDialectHwOps.h.inc -gen-op-decls)
+mlir_tablegen(MyDialectHwOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(MyDialectHwOpsIncGen)
+
 # Dialect库，MyDialect + pass实现
 add_library(MyDialectLib
   MyDialect.cpp
@@ -52,8 +58,9 @@ add_library(MyDialectLib
   ONNXToMyDialect.cpp
   mydialect-ops.cpp
   SimpleCParser.cpp
+  LowerHwMulPass.cpp
 )
-add_dependencies(MyDialectLib MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen)
+add_dependencies(MyDialectLib MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen MyDialectHwOpsIncGen)
 llvm_process_sources(MyDialectLib PARTIAL_SOURCES_INTENDED)
 target_compile_options(MyDialectLib PRIVATE -fno-rtti)
 
