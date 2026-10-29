@@ -27,5 +27,27 @@ def LowerHwMulPass : Pass<"lower-hw-mul", "mlir::ModuleOp"> {
   ];
 }
 
+// ============ OpCountCycleEstimatePass：统计 addi/muli 并估算执行周期 ============
+def OpCountCycleEstimatePass : Pass<"mydialect-count-op-cycle-est", "mlir::ModuleOp"> {
+  let summary = "Count addi/muli and estimate execution cycles with a HW resource model";
+  let description = [{
+    Walk the IR and count addi/muli operations, then estimate execution cycles
+    with a simple hardware resource model: N operations of one kind are issued
+    onto `fu` pipelined functional units with the given latency, costing
+    ceil(N / fu) + latency - 1 cycles. The add and mul pipelines run
+    concurrently, so the total estimate is the maximum of both pipelines.
+  }];
+  let options = [
+    Option<"addLatency", "add-latency", "int",
+           /*default=*/"1", "Latency of addi in cycles">,
+    Option<"mulLatency", "mul-latency", "int",
+           /*default=*/"4", "Latency of muli in cycles">,
+    Option<"addFU", "add-fu", "int",
+           /*default=*/"2", "Number of add functional units">,
+    Option<"mulFU", "mul-fu", "int",
+           /*default=*/"1", "Number of mul functional units">
+  ];
+}
+
 #endif
 

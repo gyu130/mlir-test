@@ -94,6 +94,8 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/MyOptPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/ONNXToMyDialect.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/mydialect-ops.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/OpCountCycleEstimate.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/LowerHwMulPass.cpp
   SUPPORT_PLUGINS
   )
 mlir_target_link_libraries(mlir-opt PRIVATE ${LIBS})

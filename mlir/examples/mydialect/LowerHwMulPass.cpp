@@ -75,4 +75,13 @@ std::unique_ptr<mlir::Pass> createLowerHwMulPass(bool useHardwarePath) {
   return pass;
 }
 
+// 静态注册：mlir-opt 启动时自动注册 --lower-hw-mul
+#define GEN_PASS_REGISTRATION_LOWERHWMULPASS
+#include "MyDialectPasses.h.inc"
+
+static bool lowerHwMulPassRegistered = []() {
+  registerLowerHwMulPass();
+  return true;
+}();
+
 } // namespace mydialect

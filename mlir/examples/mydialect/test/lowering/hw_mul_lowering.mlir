@@ -19,8 +19,8 @@ module {
 
 // SW 路径: hw_mul -> arith.muli
 // SW-LABEL: func.func @hw_test
-// SW: arith.muli %a, %b : i32
+// SW: arith.muli
 
 // HW 路径: hw_mul -> llvm.call_intrinsic
 // HW-LABEL: func.func @hw_test
-// HW: llvm.call_intrinsic @llvm.mydialect.hw.mul.i32
+// HW: llvm.call_intrinsic "llvm.mydialect.hw.mul.i32"

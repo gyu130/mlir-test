@@ -4,6 +4,7 @@
 #include "SimpleCParser.h"
 #include "ONNXToMyDialect.h"
 #include "LowerHwMulPass.h"
+#include "OpCountCycleEstimate.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -357,6 +358,7 @@ int main(int argc, char** argv) {
   // arith.muli / llvm.intrinsic，然后 LowerMyDialectPrint 处理剩下的
   // tensor_to_scalar / scalar_to_tensor（SimpleCParser 生成的桥接 op）
   optPM.addPass(mydialect::createLowerHwMulPass(hwLowerMode.getValue()));
+  optPM.addPass(mydialect::createOpCountCycleEstimatePass());
   optPM.addPass(mydialect::createLowerMyDialectPrint());
   optPM.addPass(mlir::createCanonicalizerPass());
   // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）

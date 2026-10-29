@@ -59,6 +59,7 @@ add_library(MyDialectLib
   mydialect-ops.cpp
   SimpleCParser.cpp
   LowerHwMulPass.cpp
+  OpCountCycleEstimate.cpp
 )
 add_dependencies(MyDialectLib MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen MyDialectHwOpsIncGen)
 llvm_process_sources(MyDialectLib PARTIAL_SOURCES_INTENDED)
