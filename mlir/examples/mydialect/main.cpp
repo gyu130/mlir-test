@@ -5,6 +5,7 @@
 #include "ONNXToMyDialect.h"
 #include "LowerHwMulPass.h"
 #include "OpCountCycleEstimate.h"
+#include "ConcurrentJit.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -29,6 +30,7 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ThreadPool.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
@@ -182,10 +184,32 @@ static llvm::cl::list<std::string> positionalArgs(
     llvm::cl::ZeroOrMore
 );
 
+static llvm::cl::opt<bool> concurrentJit(
+  "concurrent-jit",
+  llvm::cl::desc("Enable multi-thread concurrent JIT, run multiple mlir modules"),
+  llvm::cl::init(false));
+
+static llvm::cl::opt<unsigned> jitThreadCount(
+  "jit-threads",
+  llvm::cl::desc("Max thread count for concurrent JIT"),
+  llvm::cl::init(4));
+
+static llvm::cl::opt<int> jitOptLevel(
+  "jit-opt",
+  llvm::cl::desc("JIT LLVM optimization level"),
+  llvm::cl::init(2));
+
+static llvm::cl::list<std::string> jitMlirFiles(
+  "jit-mlir-files",
+  llvm::cl::desc("MLIR files to run concurrently via JIT"),
+  llvm::cl::value_desc("xxx.mlir"),
+  llvm::cl::CommaSeparated);
+
+
 int main(int argc, char** argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv);
 
-  if (!parseCInput.empty() && !parseMLIRInput.empty()) {
+  if (!parseCInput.empty() && !parseMLIRInput.empty() && !jitMlirFiles.empty()) {
     llvm::errs() << "Error: cannot use --parse-c and --parse-mlir together\n";
     return 1;
   }
@@ -232,6 +256,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (!parseMLIRInput.empty()) {
   // ========= MLIR 输入模式：--parse-mlir <file> 或 位置参数 <file> =========
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
@@ -557,6 +582,59 @@ int main(int argc, char** argv) {
   // 释放输入 memref 数据
   for (auto &m : memSlots)
     std::free(m->allocated);
+  }
+
+  if (concurrentJit) {
+  if (jitMlirFiles.empty()) {
+    llvm::errs() << "Error: --concurrent-jit requires --jit-mlir-files\n";
+    return 1;
+  }
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
+  // 多线程 JIT 模式：输入应为已 lowering 到 LLVM 方言（或可直接翻译）的模块。
+  // 必须注册 LLVM/builtin 方言翻译接口，否则 ExecutionEngine::create 内的
+  // translateModuleToLLVMIR 会因缺 interface 返回 null 报 "could not convert
+  // to LLVM IR"
+  mlir::DialectRegistry registry;
+  mlir::registerLLVMDialectTranslation(registry);
+  mlir::registerBuiltinDialectTranslation(registry);
+  registry.insert<mlir::LLVM::LLVMDialect>();
+  registry.insert<mlir::func::FuncDialect>();
+  registry.insert<mlir::arith::ArithDialect>();
+
+  // 开启MLIRContext线程安全（只读IR安全）
+  mlir::MLIRContext ctx(registry);
+  ctx.enableMultithreading();
+  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> moduleList;
+
+  for (auto &filePath : jitMlirFiles) {
+    auto modOrErr = mlir::parseSourceFile<mlir::ModuleOp>(filePath, &ctx);
+    if (!modOrErr) {
+      llvm::errs() << "Parse mlir file failed: " << filePath << "\n";
+      return 1;
+    }
+    // 注意：parseSourceFile 返回的 OwningOpRef 才持有所有权。
+    // push_back(std::move(*modOrErr)) 只是拷贝 ModuleOp 句柄（operator*
+    // 按值返回），modOrErr 在迭代末尾析构时会 erase 掉 op，导致
+    // moduleList 存悬空指针，后续 clone 复用已释放内存触发断言/段错误。
+    // 必须移动整个 OwningOpRef 完成所有权转移。
+    moduleList.push_back(std::move(modOrErr));
+  }
+
+  // 【重要】如果你需要先做 lowering（hw_mul -> arith），在这里串行跑pass
+  // PassManager pm(&ctx);
+  // pm.addPass(mydialect::createLowerHwMulToArithPass());
+  // pm.addPass(mydialect::createOpCountCycleEstimatePass());
+  // for (auto &m : moduleList) if (failed(pm.run(m.get()))) { return 1; }
+
+  if (mlir::failed(mydialect::runConcurrentJit(moduleList, jitThreadCount, jitOptLevel))) {
+    llvm::errs() << "Concurrent JIT execution failed!\n";
+    return 1;
+  }
+  }
   return 0;
 }
 
