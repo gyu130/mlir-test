@@ -383,6 +383,9 @@ int main(int argc, char** argv) {
   // memref.global/func 声明在此清理）
   optPM.addPass(mlir::createCSEPass());
   optPM.addPass(mlir::createSymbolDCEPass());
+  // 算子融合：add/mul 张量链 → fused_elementwise，须在 LowerMyDialectPrint
+  // 之前（lowering 时融合体只生成一个循环 nest，中间结果不落地 memref）
+  optPM.addPass(mydialect::createFusionElementwisePass());
   // LowerHwMulPass 必须在 LowerMyDialectPrint 之前：hw_mul 先 lower 成
   // arith.muli / llvm.intrinsic，然后 LowerMyDialectPrint 处理剩下的
   // tensor_to_scalar / scalar_to_tensor（SimpleCParser 生成的桥接 op）

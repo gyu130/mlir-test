@@ -42,6 +42,41 @@ LogicalResult MulTensorOp::verify() {
   return success();
 }
 
+// ---------------- FusedElementwiseOp ----------------
+LogicalResult FusedElementwiseOp::verify() {
+  auto resTy = llvm::dyn_cast<mydialect::MyTensorType>(getRes().getType());
+  if (!resTy) return emitOpError("result is not mydialect tensor type");
+  if (getInputs().empty())
+    return emitOpError("expected at least one input tensor");
+
+  // 所有输入张量与结果同 shape、同元素类型
+  for (mlir::Value in : getInputs()) {
+    auto inTy = llvm::dyn_cast<mydialect::MyTensorType>(in.getType());
+    if (!inTy) return emitOpError("input is not mydialect tensor type");
+    if (inTy.getShape() != resTy.getShape())
+      return emitOpError("input/result shape mismatch");
+    if (inTy.getElementType() != resTy.getElementType())
+      return emitOpError("input/result element type mismatch");
+  }
+
+  // body：单块；块参数个数 == 输入个数，且类型 == 元素类型
+  mlir::Block &blk = getBody().front();
+  if (blk.getNumArguments() != getInputs().size())
+    return emitOpError("body block argument count must equal input count");
+  for (mlir::Value arg : blk.getArguments()) {
+    if (arg.getType() != resTy.getElementType())
+      return emitOpError("body block argument type must match element type");
+  }
+
+  // 终止符必须是 fused_yield，且产出值类型 == 元素类型
+  auto yieldOp = llvm::dyn_cast<FusedYieldOp>(blk.getTerminator());
+  if (!yieldOp)
+    return emitOpError("body must be terminated by mydialect.fused_yield");
+  if (yieldOp.getValue().getType() != resTy.getElementType())
+    return emitOpError("fused_yield value type must match element type");
+  return success();
+}
+
 // ---------------- CmpITensorOp ----------------
 // 结果类型：与输入同 shape，但元素类型为 i1
 LogicalResult CmpITensorOp::inferReturnTypes(

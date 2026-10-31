@@ -781,6 +781,78 @@ struct MulTensorOpLowering
   }
 };
 
+// ============ FusedElementwiseOp: → 单个循环 nest + 内联 region 标量计算 ============
+// 与 AddTensorOpLowering 同构地生成循环骨架；循环体内不再固定 add/mul，
+// 而是把 fused region 的标量表达式按块参数映射内联（clone + IRMapping），
+// fused_yield 的值 store 到结果 memref。多次融合只产生一个循环 nest，
+// 这就是融合的收益：中间结果不再落地 memref。
+struct FusedElementwiseOpLowering
+    : public mlir::OpConversionPattern<mydialect::FusedElementwiseOp> {
+  using mlir::OpConversionPattern<
+      mydialect::FusedElementwiseOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::FusedElementwiseOp op,
+      mydialect::FusedElementwiseOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        getTypeConverter()->convertType(op.getRes().getType()));
+
+    // 防御：上游 op 未转换时 adaptor 可能仍是 MyTensorType，补 cast 到 memref
+    auto ensureMemref = [&](mlir::Value v) -> mlir::Value {
+      if (mlir::isa<mlir::MemRefType>(v.getType()))
+        return v;
+      return rewriter
+          .create<mlir::UnrealizedConversionCastOp>(
+              loc, getTypeConverter()->convertType(v.getType()), v)
+          .getResult(0);
+    };
+    llvm::SmallVector<mlir::Value> inputs;
+    for (mlir::Value v : adaptor.getInputs())
+      inputs.push_back(ensureMemref(v));
+
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+
+    // 在指定索引处：load 各输入元素 → 内联 region 标量计算 → store 结果
+    auto emitElementwise = [&](mlir::ValueRange idxs) {
+      mlir::IRMapping mapping;
+      mlir::Block &blk = op.getBody().front();
+      for (auto [arg, in] : llvm::zip(blk.getArguments(), inputs)) {
+        mlir::Value elem =
+            rewriter.create<mlir::memref::LoadOp>(loc, in, idxs);
+        mapping.map(arg, elem);
+      }
+      mlir::Value result;
+      for (mlir::Operation &inner : blk) {
+        if (auto y = mlir::dyn_cast<mydialect::FusedYieldOp>(inner)) {
+          result = mapping.lookup(y.getValue());
+          continue;
+        }
+        rewriter.clone(inner, mapping);
+      }
+      rewriter.create<mlir::memref::StoreOp>(loc, result, res, idxs);
+    };
+
+    if (resTy.getRank() == 0) {
+      emitElementwise(mlir::ValueRange{});
+    } else {
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      llvm::SmallVector<mlir::Value, 4> ivs;
+      for (int64_t d : resTy.getShape()) {
+        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
+        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
+        ivs.push_back(loop.getInductionVar());
+        rewriter.setInsertionPointToStart(loop.getBody());
+      }
+      emitElementwise(ivs);
+    }
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
 // ============ LoopOp: mydialect.loop → scf.while ============
 // 对标 ONNX Loop 语义：cond && (i < maxTrip) 时执行循环体，
 // 循环体产出 (newCond, newCarries)。
@@ -966,6 +1038,7 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
 	ConstantTensorOpLowering,
 	AddTensorOpLowering,
 	MulTensorOpLowering,
+	FusedElementwiseOpLowering,
 	LoopOpLowering,
 	TensorToScalarOpLowering,
 	ScalarToTensorOpLowering>(converter, patterns.getContext());

@@ -6,5 +6,7 @@
 namespace mydialect {
 std::unique_ptr<mlir::Pass> createMyOptPass();
 void registerMyOptPass();
+// --mydialect-fuse-elementwise：add/mul 张量链融合为 fused_elementwise
+std::unique_ptr<mlir::Pass> createFusionElementwisePass();
 } // namespace mydialect
 #endif

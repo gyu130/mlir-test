@@ -72,6 +72,40 @@ def ConstantTensorOp : Op<MyDialect, "constant_tensor", [
   }];
 }
 
+//===================== 融合逐元素算子 fused_elementwise =====================
+// 由 --mydialect-fuse-elementwise 把 add_tensor/mul_tensor 的
+// producer-consumer 链融合而成：变参输入张量 + 单块 region 描述逐元素
+// 标量计算（第 i 个 block 参数对应第 i 个输入张量的当前元素），
+// 由 FusedYieldOp 产出标量结果。
+// 设计同 LoopOp：不能用 SingleBlockImplicitTerminator（FusedYieldOp 有
+// 必需操作数，无法零操作数默认构造），终止符在 IR 中显式书写，
+// 由 FusedElementwiseOp::verify() 校验。
+def FusedElementwiseOp : Op<MyDialect, "fused_elementwise", [
+  Pure,
+  SingleBlock
+]> {
+  let arguments = (ins
+    Variadic<MyTensorType>:$inputs
+  );
+  let results = (outs MyTensorType:$res);
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+  let assemblyFormat = "$inputs attr-dict `:` type($inputs) `->` type($res) $body";
+}
+
+// fused_elementwise 的 region 终止符：产出当前元素的标量计算结果
+// value 用 AnyType：标量元素类型（i32/f32/...），由 FusedElementwiseOp
+// 的 verifier 校验其与结果张量元素类型一致
+def FusedYieldOp : Op<MyDialect, "fused_yield", [
+  Pure,
+  Terminator,
+  ParentOneOf<["FusedElementwiseOp"]>
+]> {
+  let arguments = (ins AnyType:$value);
+  let results = (outs);
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 //===================== 张量 identity identity_tensor =====================
 def IdentityTensorOp : Op<MyDialect, "identity_tensor", [
   Pure,

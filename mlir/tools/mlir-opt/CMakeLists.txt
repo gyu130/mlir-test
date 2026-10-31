@@ -92,6 +92,7 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/pass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LowerMyDialectPrint.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/MyOptPass.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/FusionPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/ONNXToMyDialect.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/mydialect-ops.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/OpCountCycleEstimate.cpp
