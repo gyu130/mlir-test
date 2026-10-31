@@ -22,5 +22,7 @@ std::unique_ptr<mlir::Pass> createPlaceDevicePass();
 // （target=cpu 内联 region，其它值保留边界）
 std::unique_ptr<mlir::Pass> createLowerDevicePass(std::string target = "cpu",
                                                   bool verbose = false);
+// --mydialect-layout-propagation：把布局转换提升出 elementwise 算子并复合
+std::unique_ptr<mlir::Pass> createLayoutPropagationPass();
 } // namespace mydialect
 #endif

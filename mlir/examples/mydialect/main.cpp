@@ -203,6 +203,12 @@ static llvm::cl::opt<std::string> deviceTarget(
                    "otherwise keep the host/device boundary"),
     llvm::cl::init("cpu"));
 
+// layout 传播开关：把布局转换提升出 elementwise 算子并复合相邻转换
+static llvm::cl::opt<bool> layoutPropagationMode(
+    "layout-propagation",
+    llvm::cl::desc("Propagate tensor layouts before operator fusion"),
+    llvm::cl::init(true));
+
 // 位置参数：<mlir-file> [intval|funcname] [funcname]
 // 必须注册位置选项：cl 在没有 positional 选项时遇到任何位置参数
 // 都会报 "Too many positional arguments" 并退出，位置参数模式会失效
@@ -415,6 +421,10 @@ int main(int argc, char** argv) {
   // memref.global/func 声明在此清理）
   optPM.addPass(mlir::createCSEPass());
   optPM.addPass(mlir::createSymbolDCEPass());
+  // layout 传播：把 transpose 类布局转换提升到 elementwise 消费端并复合，
+  // 暴露可融合的 elementwise 链（必须在算子融合之前）
+  if (layoutPropagationMode)
+    optPM.addPass(mydialect::createLayoutPropagationPass());
   // 算子融合：add/mul 张量链 → fused_elementwise，须在 LowerMyDialectPrint
   // 之前（lowering 时融合体只生成一个循环 nest，中间结果不落地 memref）
   optPM.addPass(mydialect::createFusionElementwisePass());

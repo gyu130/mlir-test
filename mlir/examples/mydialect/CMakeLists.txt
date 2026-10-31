@@ -61,6 +61,7 @@ add_library(MyDialectLib
   SchedulePass.cpp
   PlaceDevicePass.cpp
   LowerDevicePass.cpp
+  LayoutPropagationPass.cpp
   ONNXToMyDialect.cpp
   mydialect-ops.cpp
   SimpleCParser.cpp

@@ -98,6 +98,7 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/SchedulePass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/PlaceDevicePass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LowerDevicePass.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/LayoutPropagationPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/ONNXToMyDialect.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/mydialect-ops.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/OpCountCycleEstimate.cpp
