@@ -57,6 +57,7 @@ add_library(MyDialectLib
   MyOptPass.cpp
   FusionPass.cpp
   TilePass.cpp
+  ParallelPass.cpp
   ONNXToMyDialect.cpp
   mydialect-ops.cpp
   SimpleCParser.cpp

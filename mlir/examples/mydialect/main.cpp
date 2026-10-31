@@ -177,6 +177,13 @@ static llvm::cl::opt<bool> hwLowerMode(
     llvm::cl::desc("Select hw_mul lowering path: true=llvm intrinsic, false=arith.muli"),
     llvm::cl::init(false));
 
+// 并行化开关：无 iter_args 且无外部调用的 elementwise 循环提升为 scf.forall。
+// 默认开启；`--parallelize=false` 可关闭以便 A/B 对比。
+static llvm::cl::opt<bool> parallelizeMode(
+    "parallelize",
+    llvm::cl::desc("Promote legal elementwise scf.for loops to scf.forall"),
+    llvm::cl::init(true));
+
 // 位置参数：<mlir-file> [intval|funcname] [funcname]
 // 必须注册位置选项：cl 在没有 positional 选项时遇到任何位置参数
 // 都会报 "Too many positional arguments" 并退出，位置参数模式会失效
@@ -401,6 +408,10 @@ int main(int argc, char** argv) {
   // 分块：对 lowering 生成的 elementwise scf.for 做 strip-mining
   // （必须在 LowerMyDialectPrint 之后，loop 才存在）
   optPM.addPass(mydialect::createTilePass());
+  // 并行化：tile 之后把最外层分块循环提升为 scf.forall
+  // （含外部调用的循环如 print 保持串行；scf.forall 由 SCFToControlFlow 串行展开）
+  if (parallelizeMode)
+    optPM.addPass(mydialect::createParallelPass());
   // affine → std：affine.min（分块边界）在 convert-to-llvm 前必须降级，
   // 否则会残留 index 类型的 unrealized_conversion_cast
   optPM.addPass(mlir::createLowerAffinePass());
