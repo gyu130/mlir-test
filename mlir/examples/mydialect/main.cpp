@@ -209,6 +209,27 @@ static llvm::cl::opt<bool> layoutPropagationMode(
     llvm::cl::desc("Propagate tensor layouts before operator fusion"),
     llvm::cl::init(true));
 
+// 优化档位：统一控制可选优化 pass 的开启程度
+//   0 = 仅做必要的方言降级（不做任何可选优化）
+//   1 = 局部/图清理优化（MyOpt、常量折叠、CSE、SymbolDCE、layout 传播）
+//   2 = 全量图优化（在 1 的基础上加算子融合、tiling、并行化、指令调度）—— 默认
+// 显式给出的 granular 开关（--parallelize/--schedule/--layout-propagation/
+// --device-placement）优先于档位；未显式给出时由档位决定。
+static llvm::cl::opt<int> optLevel(
+    "opt-level",
+    llvm::cl::desc("Optimization level: 0=lowering only, 1=local opts, "
+                   "2=full graph opts (default)"),
+    llvm::cl::init(2));
+
+// 解析单个可选 pass 是否启用：命令行显式给出的 granular 开关优先，
+// 否则按 opt-level 是否达到 requiredLevel 判定
+static bool resolveToggle(const llvm::cl::opt<bool> &flag, int level,
+                          int requiredLevel) {
+  if (flag.getNumOccurrences() > 0)
+    return flag.getValue();
+  return level >= requiredLevel;
+}
+
 // 位置参数：<mlir-file> [intval|funcname] [funcname]
 // 必须注册位置选项：cl 在没有 positional 选项时遇到任何位置参数
 // 都会报 "Too many positional arguments" 并退出，位置参数模式会失效
@@ -414,23 +435,38 @@ int main(int argc, char** argv) {
   }
 
   // Pass流水线
+  // opt-level 档位派生：
+  //   level>=1 开启局部/图清理优化；level>=2 开启全量图优化；
+  //   granular 开关显式给出时优先。
+  int level = optLevel.getValue();
+  if (level < 0) level = 0;
+  bool doLocalOpts = level >= 1;
+  bool doGraphOpts = level >= 2;
+  bool doLayout = resolveToggle(layoutPropagationMode, level, 1);
+  bool doPlaceDevice = resolveToggle(devicePlacementMode, level, 1);
+  bool doParallel = resolveToggle(parallelizeMode, level, 2);
+  bool doSchedule = resolveToggle(scheduleMode, level, 2);
+
   mlir::PassManager optPM(&ctx);
-  optPM.addPass(mydialect::createMyOptPass()); // 高层优化Pass
-  optPM.addPass(mydialect::createConstantFoldMyDialectPass());
-  // 全局公共子表达式消除 + 死符号消除（折叠/优化后残留的重复计算与无用
-  // memref.global/func 声明在此清理）
-  optPM.addPass(mlir::createCSEPass());
-  optPM.addPass(mlir::createSymbolDCEPass());
-  // layout 传播：把 transpose 类布局转换提升到 elementwise 消费端并复合，
-  // 暴露可融合的 elementwise 链（必须在算子融合之前）
-  if (layoutPropagationMode)
-    optPM.addPass(mydialect::createLayoutPropagationPass());
+  if (doLocalOpts) {
+    optPM.addPass(mydialect::createMyOptPass()); // 高层优化Pass
+    optPM.addPass(mydialect::createConstantFoldMyDialectPass());
+    // 全局公共子表达式消除 + 死符号消除（折叠/优化后残留的重复计算与无用
+    // memref.global/func 声明在此清理）
+    optPM.addPass(mlir::createCSEPass());
+    optPM.addPass(mlir::createSymbolDCEPass());
+    // layout 传播：把 transpose 类布局转换提升到 elementwise 消费端并复合，
+    // 暴露可融合的 elementwise 链（必须在算子融合之前）
+    if (doLayout)
+      optPM.addPass(mydialect::createLayoutPropagationPass());
+  }
   // 算子融合：add/mul 张量链 → fused_elementwise，须在 LowerMyDialectPrint
   // 之前（lowering 时融合体只生成一个循环 nest，中间结果不落地 memref）
-  optPM.addPass(mydialect::createFusionElementwisePass());
+  if (doGraphOpts)
+    optPM.addPass(mydialect::createFusionElementwisePass());
   // 异构部署：hw_mul 仍存在时先做 device placement，把设备子图包进
   // mydialect.device_exec region（形成 host ↔ device 流水线边界）
-  if (devicePlacementMode)
+  if (doPlaceDevice)
     optPM.addPass(mydialect::createPlaceDevicePass());
   // LowerHwMulPass 必须在 LowerMyDialectPrint 之前：hw_mul 先 lower 成
   // arith.muli / llvm.intrinsic，然后 LowerMyDialectPrint 处理剩下的
@@ -439,22 +475,23 @@ int main(int argc, char** argv) {
   optPM.addPass(mydialect::createOpCountCycleEstimatePass());
   optPM.addPass(mydialect::createLowerMyDialectPrint());
   // 边界落地：cpu 目标内联 device_exec（设备算子退回 host 执行）
-  if (devicePlacementMode)
+  if (doPlaceDevice)
     optPM.addPass(
         mydialect::createLowerDevicePass(deviceTarget.getValue()));
   // 分块：对 lowering 生成的 elementwise scf.for 做 strip-mining
   // （必须在 LowerMyDialectPrint 之后，loop 才存在）
-  optPM.addPass(mydialect::createTilePass());
+  if (doGraphOpts)
+    optPM.addPass(mydialect::createTilePass());
   // 并行化：tile 之后把最外层分块循环提升为 scf.forall
   // （含外部调用的循环如 print 保持串行；scf.forall 由 SCFToControlFlow 串行展开）
-  if (parallelizeMode)
+  if (doParallel)
     optPM.addPass(mydialect::createParallelPass());
   // affine → std：affine.min（分块边界）在 convert-to-llvm 前必须降级，
   // 否则会残留 index 类型的 unrealized_conversion_cast
   optPM.addPass(mlir::createLowerAffinePass());
   optPM.addPass(mlir::createCanonicalizerPass());
   // 指令调度：在 LLVM lowering 前对基本块内无副作用算子做 list scheduling
-  if (scheduleMode)
+  if (doSchedule)
     optPM.addPass(mydialect::createSchedulePass());
   // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）
   optPM.addPass(mlir::createSCFToControlFlowPass());
