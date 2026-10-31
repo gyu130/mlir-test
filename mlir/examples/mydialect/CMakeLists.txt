@@ -56,6 +56,7 @@ add_library(MyDialectLib
   LowerMyDialectPrint.cpp
   MyOptPass.cpp
   FusionPass.cpp
+  TilePass.cpp
   ONNXToMyDialect.cpp
   mydialect-ops.cpp
   SimpleCParser.cpp
@@ -79,6 +80,7 @@ target_link_libraries(MyDialectLib
     MLIRLLVMDialect
     MLIRPass
     MLIRTransforms
+    MLIRAffineDialect
 )
 
 
@@ -112,7 +114,10 @@ target_link_libraries(mydriver
     MLIRUBToLLVM
     MLIRTensorDialect
     MLIRComplexToLLVM
+    MLIRVectorToLLVM
+    MLIRVectorDialect
     MLIRBuiltinToLLVMIRTranslation
+    MLIRAffineToStandard
     LLVMX86AsmParser
 )
 

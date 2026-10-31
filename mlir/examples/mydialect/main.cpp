@@ -25,6 +25,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
@@ -147,6 +148,7 @@ static void printElem(const char *buf, int64_t i, char kind, unsigned width) {
 }
 } // anonymous namespace
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Conversion/Passes.h"
 
 extern "C" void my_runtime_print_i32(int32_t val) {
 	fprintf(stdout, "[my-runtime-print] value = %d\n", val);
@@ -271,6 +273,10 @@ int main(int argc, char** argv) {
   mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+  // lower-affine pass（AffineToStandard）在依赖分析时会级联加载 vector 方言，
+  // vector 同样声明了 ConvertToLLVMPatternInterface 的 promise，
+  // 因此必须注册其实现扩展，否则 convert-to-llvm 会触发同类致命错误
+  mlir::vector::registerConvertVectorToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
   mlir::ub::registerConvertUBToLLVMInterface(registry);
   mlir::registerLLVMDialectTranslation(registry);
@@ -392,6 +398,12 @@ int main(int argc, char** argv) {
   optPM.addPass(mydialect::createLowerHwMulPass(hwLowerMode.getValue()));
   optPM.addPass(mydialect::createOpCountCycleEstimatePass());
   optPM.addPass(mydialect::createLowerMyDialectPrint());
+  // 分块：对 lowering 生成的 elementwise scf.for 做 strip-mining
+  // （必须在 LowerMyDialectPrint 之后，loop 才存在）
+  optPM.addPass(mydialect::createTilePass());
+  // affine → std：affine.min（分块边界）在 convert-to-llvm 前必须降级，
+  // 否则会残留 index 类型的 unrealized_conversion_cast
+  optPM.addPass(mlir::createLowerAffinePass());
   optPM.addPass(mlir::createCanonicalizerPass());
   // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）
   optPM.addPass(mlir::createSCFToControlFlowPass());
