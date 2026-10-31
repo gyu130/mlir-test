@@ -15,6 +15,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/SymbolTable.h"
 
 namespace {
@@ -232,6 +235,78 @@ struct FoldAddiPattern : public mlir::RewritePattern {
     mlir::ImplicitLocOpBuilder ib(op->getLoc(), rewriter);
     auto newConst = mlir::arith::ConstantOp::create(ib, rewriter.getI32IntegerAttr(res));
     rewriter.replaceOp(op, newConst);
+    return mlir::success();
+  }
+};
+
+// ============ 6.1 张量级常量折叠 ============
+// add_tensor(constant_tensor, constant_tensor) 与
+// mul_tensor(...) 直接算出新常量：逐元素对 DenseElementsAttr 求值，
+// 结果仍为 constant_tensor（形状/元素类型与输入一致）。
+//
+// 逐元素求值辅助函数（非模板，避免模板内依赖名的 getValues<> 解析歧义）：
+// 不支持的类型返回 nullopt
+static std::optional<mlir::ElementsAttr>
+evalTensorBinaryConst(mlir::ElementsAttr lhs, mlir::ElementsAttr rhs,
+                      bool isAdd) {
+  auto lhsAttr = llvm::dyn_cast<mlir::DenseElementsAttr>(lhs);
+  auto rhsAttr = llvm::dyn_cast<mlir::DenseElementsAttr>(rhs);
+  if (!lhsAttr || !rhsAttr)
+    return std::nullopt;
+
+  auto shapedTy = llvm::cast<mlir::ShapedType>(lhsAttr.getType());
+
+  if (llvm::isa<mlir::DenseIntElementsAttr>(lhsAttr)) {
+    if (!llvm::isa<mlir::DenseIntElementsAttr>(rhsAttr))
+      return std::nullopt;
+    llvm::SmallVector<llvm::APInt> vals;
+    for (auto [l, r] : llvm::zip(lhsAttr.getValues<llvm::APInt>(),
+                                 rhsAttr.getValues<llvm::APInt>()))
+      vals.push_back(isAdd ? l + r : l * r);
+    return mlir::ElementsAttr(mlir::DenseIntElementsAttr::get(shapedTy, vals));
+  }
+
+  if (llvm::isa<mlir::DenseFPElementsAttr>(lhsAttr)) {
+    if (!llvm::isa<mlir::DenseFPElementsAttr>(rhsAttr))
+      return std::nullopt;
+    llvm::SmallVector<llvm::APFloat> vals;
+    for (auto [l, r] : llvm::zip(lhsAttr.getValues<llvm::APFloat>(),
+                                 rhsAttr.getValues<llvm::APFloat>())) {
+      llvm::APFloat v = l;
+      if (isAdd)
+        v.add(r, llvm::APFloat::rmNearestTiesToEven);
+      else
+        v.multiply(r, llvm::APFloat::rmNearestTiesToEven);
+      vals.push_back(v);
+    }
+    return mlir::ElementsAttr(mlir::DenseFPElementsAttr::get(shapedTy, vals));
+  }
+
+  return std::nullopt;
+}
+
+template <typename OpTy, bool IsAdd>
+struct FoldTensorBinaryPattern : public mlir::RewritePattern {
+  FoldTensorBinaryPattern(mlir::MLIRContext *ctx)
+      : mlir::RewritePattern(OpTy::getOperationName(), 1, ctx) {}
+
+  llvm::LogicalResult matchAndRewrite(mlir::Operation *op,
+                                      mlir::PatternRewriter &rewriter) const override {
+    auto binOp = llvm::cast<OpTy>(op);
+    auto lhsC = binOp.getLhs().template getDefiningOp<mydialect::ConstantTensorOp>();
+    auto rhsC = binOp.getRhs().template getDefiningOp<mydialect::ConstantTensorOp>();
+    if (!lhsC || !rhsC)
+      return mlir::failure();
+
+    auto newAttr =
+        evalTensorBinaryConst(lhsC.getValue(), rhsC.getValue(), IsAdd);
+    if (!newAttr)
+      return mlir::failure();
+
+    // 结果 MyTensorType 由原 op 决定（shape/元素类型与常量 attr 一致）
+    auto resTy = llvm::cast<mydialect::MyTensorType>(binOp.getResult().getType());
+    rewriter.replaceOpWithNewOp<mydialect::ConstantTensorOp>(op, resTy,
+                                                             *newAttr);
     return mlir::success();
   }
 };
@@ -472,6 +547,8 @@ struct ConstantFoldMyDialectPass
     mlir::RewritePatternSet patterns(&getContext());
     patterns.add<FoldMuliPattern,
 	    FoldAddiPattern,
+	    FoldTensorBinaryPattern<mydialect::AddTensorOp, /*IsAdd=*/true>,
+	    FoldTensorBinaryPattern<mydialect::MulTensorOp, /*IsAdd=*/false>,
 	    ConstantFoldMyDialectPattern,
 	    ConstantEvaluateForPattern,
 	    ConstantUnrollForPattern,

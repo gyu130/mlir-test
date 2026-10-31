@@ -80,6 +80,82 @@ struct AddiCSEPattern : public OpRewritePattern<arith::AddIOp> {
 };
 
 // ==============================
+// Pattern 3：identity_tensor(x) → x
+// identity 语义即透传；verifier 已保证输入/结果类型相同，直接替换
+// ==============================
+struct IdentityTensorFoldPattern
+    : public OpRewritePattern<IdentityTensorOp> {
+  using OpRewritePattern<IdentityTensorOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(IdentityTensorOp op,
+                                PatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, op.getIn());
+    return success();
+  }
+};
+
+// ==============================
+// Pattern 4：transpose(transpose(x, p1), p2) → x
+// 条件：两次置换复合为恒等（out2 维度 m ← out1 维度 p2[m] ← x 维度 p1[p2[m]]，
+// 要求 p1[p2[m]] == m）。结果类型与原始输入一致时方可折叠。
+// ==============================
+struct DoubleTransposeFoldPattern
+    : public OpRewritePattern<TransposeTensorOp> {
+  using OpRewritePattern<TransposeTensorOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TransposeTensorOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inner = op.getData().getDefiningOp<TransposeTensorOp>();
+    if (!inner)
+      return failure();
+    // 恒等置换必然使结果类型等于原始输入类型，此处兼作安全校验
+    if (op.getResult().getType() != inner.getData().getType())
+      return failure();
+
+    auto p2 = op.getPerm();
+    auto p1 = inner.getPerm();
+    if (p1.size() != p2.size())
+      return failure();
+    for (size_t m = 0; m < p2.size(); ++m) {
+      int64_t outerIdx = cast<IntegerAttr>(p2[m]).getInt();
+      int64_t xIdx = cast<IntegerAttr>(p1[outerIdx]).getInt();
+      if (xIdx != static_cast<int64_t>(m))
+        return failure();
+    }
+
+    Value src = inner.getData();
+    rewriter.replaceOp(op, src);
+    // 内层 transpose 可能只剩本次使用，变死代码时顺手删除
+    if (inner->use_empty())
+      rewriter.eraseOp(inner);
+    return success();
+  }
+};
+
+// ==============================
+// Pattern 5：reshape(reshape(x, s1), s2) → reshape(x, s2)
+// reshape 只按元素总数重解释布局，内层 reshape 的中间 shape 对外层无影响
+// ==============================
+struct ChainedReshapeFoldPattern
+    : public OpRewritePattern<ReshapeTensorOp> {
+  using OpRewritePattern<ReshapeTensorOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReshapeTensorOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inner = op.getData().getDefiningOp<ReshapeTensorOp>();
+    if (!inner)
+      return failure();
+
+    auto newOp = rewriter.create<ReshapeTensorOp>(
+        op.getLoc(), op.getResult().getType(), inner.getData(), op.getShape());
+    rewriter.replaceOp(op, newOp.getResult());
+    if (inner->use_empty())
+      rewriter.eraseOp(inner);
+    return success();
+  }
+};
+
+// ==============================
 // 主Pass：继承TableGen生成的Base，内部用Pattern驱动优化
 // ==============================
 struct MyOptPass : public impl::MyOptPassBase<MyOptPass> {
@@ -97,7 +173,9 @@ void MyOptPass::runOnOperation() {
 
   // 1. 构建Pattern集合：所有优化规则在这里add，新增优化只需要新增Pattern类即可
   RewritePatternSet patterns(ctx);
-  patterns.add<RemoveRedundantPrintPattern, AddiCSEPattern>(ctx);
+  patterns.add<RemoveRedundantPrintPattern, AddiCSEPattern,
+               IdentityTensorFoldPattern, DoubleTransposeFoldPattern,
+               ChainedReshapeFoldPattern>(ctx);
 
   // 2. 贪婪重写：自动迭代直到没有Pattern可以匹配，自动处理use-def安全替换/删除
   GreedyRewriteConfig config;
