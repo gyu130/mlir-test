@@ -184,6 +184,12 @@ static llvm::cl::opt<bool> parallelizeMode(
     llvm::cl::desc("Promote legal elementwise scf.for loops to scf.forall"),
     llvm::cl::init(true));
 
+// 指令调度开关：基本块级 list scheduling（FU 数量 + 延迟模型）
+static llvm::cl::opt<bool> scheduleMode(
+    "schedule",
+    llvm::cl::desc("Enable block-level list scheduling before LLVM lowering"),
+    llvm::cl::init(true));
+
 // 位置参数：<mlir-file> [intval|funcname] [funcname]
 // 必须注册位置选项：cl 在没有 positional 选项时遇到任何位置参数
 // 都会报 "Too many positional arguments" 并退出，位置参数模式会失效
@@ -416,6 +422,9 @@ int main(int argc, char** argv) {
   // 否则会残留 index 类型的 unrealized_conversion_cast
   optPM.addPass(mlir::createLowerAffinePass());
   optPM.addPass(mlir::createCanonicalizerPass());
+  // 指令调度：在 LLVM lowering 前对基本块内无副作用算子做 list scheduling
+  if (scheduleMode)
+    optPM.addPass(mydialect::createSchedulePass());
   // scf -> cf（此版本 --convert-to-llvm 不直接降低 scf）
   optPM.addPass(mlir::createSCFToControlFlowPass());
   // cf -> llvm 等方言到 LLVM 的转换

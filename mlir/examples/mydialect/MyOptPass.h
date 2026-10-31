@@ -12,5 +12,7 @@ std::unique_ptr<mlir::Pass> createFusionElementwisePass();
 std::unique_ptr<mlir::Pass> createTilePass();
 // --mydialect-parallelize：把可安全并行的 elementwise scf.for 提升为 scf.forall
 std::unique_ptr<mlir::Pass> createParallelPass();
+// --mydialect-schedule：基本块级 list scheduling（FU 数量 + 延迟模型）
+std::unique_ptr<mlir::Pass> createSchedulePass();
 } // namespace mydialect
 #endif
