@@ -2,6 +2,7 @@
 #define MYOPT_PASS_H
 #include "mlir/Pass/Pass.h"
 #include <memory>
+#include <string>
 
 namespace mydialect {
 std::unique_ptr<mlir::Pass> createMyOptPass();
@@ -14,5 +15,12 @@ std::unique_ptr<mlir::Pass> createTilePass();
 std::unique_ptr<mlir::Pass> createParallelPass();
 // --mydialect-schedule：基本块级 list scheduling（FU 数量 + 延迟模型）
 std::unique_ptr<mlir::Pass> createSchedulePass();
+// --mydialect-place-device：以 hw_mul 为种子做 device placement，
+// 把设备子图包进 mydialect.device_exec region
+std::unique_ptr<mlir::Pass> createPlaceDevicePass();
+// --mydialect-lower-device：按 target 落地 device_exec 边界
+// （target=cpu 内联 region，其它值保留边界）
+std::unique_ptr<mlir::Pass> createLowerDevicePass(std::string target = "cpu",
+                                                  bool verbose = false);
 } // namespace mydialect
 #endif

@@ -6,6 +6,7 @@ include "mlir/IR/AttrTypeBase.td"
 
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/BuiltinTypes.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def MyDialect : Dialect {
   let name = "mydialect";
@@ -64,14 +65,14 @@ def WrappedI32TypeConstraint : Type<CPred<"$_self.isa<::mydialect::WrappedI32Typ
 // 注意：MyTensorType 是自定义 TypeDef，在 ODS 里不能作为 operand/result
 // 直接声明（ODS 需要 "buildable" type），这里用 AnyType + assemblyFormat
 // 指令手动指定类型。
-def ScalarToTensorOp : Op<MyDialect, "scalar_to_tensor"> {
+def ScalarToTensorOp : Op<MyDialect, "scalar_to_tensor", [Pure]> {
   let summary = "Wrap scalar i32 to 0-dim mydialect tensor";
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$output);
   let assemblyFormat = "$input attr-dict `:` type($input) `,` type($output)";
 }
 
-def TensorToScalarOp : Op<MyDialect, "tensor_to_scalar"> {
+def TensorToScalarOp : Op<MyDialect, "tensor_to_scalar", [Pure]> {
   let summary = "Extract scalar i32 from 0-dim mydialect tensor";
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$output);
@@ -94,7 +95,7 @@ def PrintStrOp : Op<MyDialect, "print_str"> {
   let assemblyFormat = "$str `:` type($str) attr-dict";
 }
 
-def AddI32Op : Op<MyDialect, "addi"> {
+def AddI32Op : Op<MyDialect, "addi", [Pure]> {
   let summary = "i32 add for mydialect";
   let description = "Add two i32 operands";
   let arguments = (ins I32:$lhs, I32:$rhs);
@@ -104,7 +105,7 @@ def AddI32Op : Op<MyDialect, "addi"> {
   let hasCanonicalizer = 1;
 }
 
-def MuliOp : Op<MyDialect, "muli"> {
+def MuliOp : Op<MyDialect, "muli", [Pure]> {
   let summary = "i32 multiply for mydialect";
   let description = "Multiply two i32 operands";
   let arguments = (ins I32:$lhs, I32:$rhs);
@@ -114,7 +115,7 @@ def MuliOp : Op<MyDialect, "muli"> {
   let hasCanonicalizer = 1;
 }
 
-def SubI32Op : Op<MyDialect, "subi"> {
+def SubI32Op : Op<MyDialect, "subi", [Pure]> {
   let summary = "i32 subtract for mydialect";
   let description = "Subtract two i32 operands";
   let arguments = (ins I32:$lhs, I32:$rhs);
@@ -124,7 +125,7 @@ def SubI32Op : Op<MyDialect, "subi"> {
   let hasCanonicalizer = 1;
 }
 
-def DivSIOp : Op<MyDialect, "divi_s"> {
+def DivSIOp : Op<MyDialect, "divi_s", [Pure]> {
   let summary = "signed i32 divide for mydialect";
   let description = "Signed divide two i32 operands";
   let arguments = (ins I32:$lhs, I32:$rhs);
@@ -136,7 +137,7 @@ def DivSIOp : Op<MyDialect, "divi_s"> {
 }
 
 // mydialect.cmpi slt, %a, %b : i32  →  i1
-def CmpiOp : Op<MyDialect, "cmpi"> {
+def CmpiOp : Op<MyDialect, "cmpi", [Pure]> {
   let arguments = (ins I32:$lhs, I32:$rhs, StrAttr:$predicate);
   let results = (outs I1:$res);
   let assemblyFormat = "$lhs `,` $rhs `,` $predicate `:` type($lhs) attr-dict";

@@ -77,6 +77,22 @@ LogicalResult FusedElementwiseOp::verify() {
   return success();
 }
 
+// ---------------- DeviceExecOp ----------------
+// region 终止符必须是 device_yield，且产出值个数/类型与 op 结果一致
+LogicalResult DeviceExecOp::verify() {
+  mlir::Block &blk = getBody().front();
+  auto yieldOp = llvm::dyn_cast<DeviceYieldOp>(blk.getTerminator());
+  if (!yieldOp)
+    return emitOpError("body must be terminated by mydialect.device_yield");
+  if (yieldOp.getNumOperands() != getNumResults())
+    return emitOpError("device_yield operand count must equal result count");
+  for (size_t i = 0; i < getNumResults(); ++i) {
+    if (yieldOp.getOperand(i).getType() != getResult(i).getType())
+      return emitOpError("device_yield operand type must match result type");
+  }
+  return success();
+}
+
 // ---------------- CmpITensorOp ----------------
 // 结果类型：与输入同 shape，但元素类型为 i1
 LogicalResult CmpITensorOp::inferReturnTypes(
