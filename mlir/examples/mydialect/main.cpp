@@ -379,6 +379,10 @@ int main(int argc, char** argv) {
   mlir::PassManager optPM(&ctx);
   optPM.addPass(mydialect::createMyOptPass()); // 高层优化Pass
   optPM.addPass(mydialect::createConstantFoldMyDialectPass());
+  // 全局公共子表达式消除 + 死符号消除（折叠/优化后残留的重复计算与无用
+  // memref.global/func 声明在此清理）
+  optPM.addPass(mlir::createCSEPass());
+  optPM.addPass(mlir::createSymbolDCEPass());
   // LowerHwMulPass 必须在 LowerMyDialectPrint 之前：hw_mul 先 lower 成
   // arith.muli / llvm.intrinsic，然后 LowerMyDialectPrint 处理剩下的
   // tensor_to_scalar / scalar_to_tensor（SimpleCParser 生成的桥接 op）
