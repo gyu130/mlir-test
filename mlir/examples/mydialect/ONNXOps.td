@@ -38,6 +38,26 @@ def ONNXMulOp : Op<OnnxDialect, "Mul", [
   let assemblyFormat = "$a `,` $b attr-dict `:` type($a)";
 }
 
+// ONNX Sub: A, B -> C (element-wise sub)
+def ONNXSubOp : Op<OnnxDialect, "Sub", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins AnyTensor:$a, AnyTensor:$b);
+  let results = (outs AnyTensor:$c);
+  let assemblyFormat = "$a `,` $b attr-dict `:` type($a)";
+}
+
+// ONNX Div: A, B -> C (element-wise div)
+def ONNXDivOp : Op<OnnxDialect, "Div", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins AnyTensor:$a, AnyTensor:$b);
+  let results = (outs AnyTensor:$c);
+  let assemblyFormat = "$a `,` $b attr-dict `:` type($a)";
+}
+
 // ONNX Equal: A, B -> C (element-wise equality compare, C is i1 tensor)
 def ONNXEqualOp : Op<OnnxDialect, "Equal", [
   Pure,

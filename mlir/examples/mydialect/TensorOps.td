@@ -35,6 +35,37 @@ def MulTensorOp : Op<MyDialect, "mul_tensor", [
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($res)";
 }
 
+//===================== 张量逐元素减法 sub_tensor =====================
+// 结构同 AddTensorOp / MulTensorOp；LowerMyDialectPrint 里同构处理
+// （元素类型为整数 → arith.subi；浮点 → arith.subf）。
+def SubTensorOp : Op<MyDialect, "sub_tensor", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins
+    MyTensorType:$lhs,
+    MyTensorType:$rhs
+  );
+  let results = (outs MyTensorType:$res);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($res)";
+}
+
+//===================== 张量逐元素除法 div_tensor =====================
+// 结构同 AddTensorOp / MulTensorOp；LowerMyDialectPrint 里同构处理
+// （元素类型为整数 → arith.divis；浮点 → arith.divf）。
+// 不做静态除零 verifier（逐元素除零是运行时语义），由编译器/运行时处理。
+def DivTensorOp : Op<MyDialect, "div_tensor", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins
+    MyTensorType:$lhs,
+    MyTensorType:$rhs
+  );
+  let results = (outs MyTensorType:$res);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($res)";
+}
+
 //===================== 张量逐元素整数比较 cmpi_tensor =====================
 // CmpITensorOp 结果为 i1 张量，与输入张量类型不同，无法用 SameOperandsAndResultType，
 // 需手写 inferReturnTypes 显式构造 i1 张量结果类型。

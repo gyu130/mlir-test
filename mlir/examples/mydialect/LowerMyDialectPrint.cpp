@@ -139,6 +139,8 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::ConstantTensorOp>();
     target.addIllegalOp<mydialect::AddTensorOp>();
     target.addIllegalOp<mydialect::MulTensorOp>();
+    target.addIllegalOp<mydialect::SubTensorOp>();
+    target.addIllegalOp<mydialect::DivTensorOp>();
     target.addIllegalOp<mydialect::FusedElementwiseOp>();
     target.addIllegalOp<mydialect::CmpITensorOp>();
     target.addIllegalOp<mydialect::IdentityTensorOp>();

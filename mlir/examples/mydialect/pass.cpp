@@ -832,6 +832,65 @@ struct MulTensorOpLowering
   }
 };
 
+// ============ SubTensorOp: mydialect.sub_tensor → 同构 Add/Mul，arith.subi/subf ============
+struct SubTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::SubTensorOp> {
+  using mlir::OpConversionPattern<mydialect::SubTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::SubTensorOp op, mydialect::SubTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
+    mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    mlir::Type elemTy = resTy.getElementType();
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
+      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
+      mlir::Value diff = mlir::isa<mlir::IntegerType>(elemTy)
+        ? (mlir::Value)mlir::arith::SubIOp::create(rewriter, loc, lv, rv)
+        : (mlir::Value)mlir::arith::SubFOp::create(rewriter, loc, lv, rv);
+      rewriter.create<mlir::memref::StoreOp>(loc, diff, res, idxs);
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
+// ============ DivTensorOp: mydialect.div_tensor → 同构 Add/Mul，arith.divis/divf ============
+// 注：整数除法走 DivSIOp（有符号）；无静态除零 verifier（逐元素除零是运行时语义）。
+struct DivTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::DivTensorOp> {
+  using mlir::OpConversionPattern<mydialect::DivTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::DivTensorOp op, mydialect::DivTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
+    mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    mlir::Type elemTy = resTy.getElementType();
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
+      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
+      mlir::Value q = mlir::isa<mlir::IntegerType>(elemTy)
+        ? (mlir::Value)mlir::arith::DivSIOp::create(rewriter, loc, lv, rv)
+        : (mlir::Value)mlir::arith::DivFOp::create(rewriter, loc, lv, rv);
+      rewriter.create<mlir::memref::StoreOp>(loc, q, res, idxs);
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
 // ============ FusedElementwiseOp: → 单个循环 nest + 内联 region 标量计算 ============
 // 与 AddTensorOpLowering 同构地生成循环骨架；循环体内不再固定 add/mul，
 // 而是把 fused region 的标量表达式按块参数映射内联（clone + IRMapping），
@@ -1255,6 +1314,8 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
 	ConstantTensorOpLowering,
 	AddTensorOpLowering,
 	MulTensorOpLowering,
+	SubTensorOpLowering,
+	DivTensorOpLowering,
 	FusedElementwiseOpLowering,
 	CmpITensorOpLowering,
 	IdentityTensorOpLowering,

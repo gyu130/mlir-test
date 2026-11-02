@@ -158,6 +158,40 @@ private:
   mlir::TypeConverter &converter;
 };
 
+// ONNX.Sub -> mydialect.sub_tensor
+struct ConvertONNXSub : public mlir::OpRewritePattern<mlir::onnx::ONNXSubOp> {
+  ConvertONNXSub(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXSubOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getResult().getType());
+    if (!outTy) return failure();
+    auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
+    auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
+    rewriter.replaceOpWithNewOp<mydialect::SubTensorOp>(op, outTy, a, b);
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
+// ONNX.Div -> mydialect.div_tensor
+struct ConvertONNXDiv : public mlir::OpRewritePattern<mlir::onnx::ONNXDivOp> {
+  ConvertONNXDiv(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXDivOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getResult().getType());
+    if (!outTy) return failure();
+    auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
+    auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
+    rewriter.replaceOpWithNewOp<mydialect::DivTensorOp>(op, outTy, a, b);
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
 // ONNX.Equal -> mydialect.cmpi_tensor
 // predicate 采用 arith::CmpIPredicate 枚举值：eq=0
 struct ConvertONNXEqual : public mlir::OpRewritePattern<mlir::onnx::ONNXEqualOp> {
@@ -472,6 +506,8 @@ void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
   auto *ctx = patterns.getContext();
   patterns.add<ConvertONNXAdd>(ctx, typeConverter);
   patterns.add<ConvertONNXMul>(ctx, typeConverter);
+  patterns.add<ConvertONNXSub>(ctx, typeConverter);
+  patterns.add<ConvertONNXDiv>(ctx, typeConverter);
   patterns.add<ConvertONNXEqual>(ctx, typeConverter);
   patterns.add<ConvertONNXConstant>(ctx, typeConverter);
   patterns.add<ConvertONNXIdentity>(ctx, typeConverter);
