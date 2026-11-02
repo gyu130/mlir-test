@@ -158,7 +158,8 @@ private:
   mlir::TypeConverter &converter;
 };
 
-// ONNX.Equal -> mydialect.cmpi_tensor（predicate = 4 表示 "eq"）
+// ONNX.Equal -> mydialect.cmpi_tensor
+// predicate 采用 arith::CmpIPredicate 枚举值：eq=0
 struct ConvertONNXEqual : public mlir::OpRewritePattern<mlir::onnx::ONNXEqualOp> {
   ConvertONNXEqual(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
       : OpRewritePattern(ctx), converter(c) {}
@@ -170,7 +171,8 @@ struct ConvertONNXEqual : public mlir::OpRewritePattern<mlir::onnx::ONNXEqualOp>
     auto i1Ty = IntegerType::get(rewriter.getContext(), 1);
     auto outTy = mydialect::MyTensorType::get(
         rewriter.getContext(), lhsTensorTy.getShape(), i1Ty);
-    auto predAttr = rewriter.getI64IntegerAttr(4);
+    // eq = 0，与 arith::CmpIPredicate 枚举一致
+    auto predAttr = rewriter.getI64IntegerAttr(0);
     auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
     auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
     rewriter.replaceOpWithNewOp<mydialect::CmpITensorOp>(op, outTy, a, b, predAttr);
@@ -265,6 +267,7 @@ private:
 };
 
 // ONNX.ReduceSum -> mydialect.reduce_sum_tensor
+// ONNX 语义：缺省 axes 时归约所有维度。
 struct ConvertONNXReduceSum : public mlir::OpRewritePattern<mlir::onnx::ONNXReduceSumOp> {
   ConvertONNXReduceSum(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
       : OpRewritePattern(ctx), converter(c) {}
@@ -273,7 +276,22 @@ struct ConvertONNXReduceSum : public mlir::OpRewritePattern<mlir::onnx::ONNXRedu
     auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
     if (!outTy) return failure();
     ArrayAttr axesAttr = op.getAxesAttr();
-    if (!axesAttr) axesAttr = rewriter.getArrayAttr({});
+    if (!axesAttr || axesAttr.empty()) {
+      // ONNX 缺省 axes：归约所有维度。
+      // 从 data 类型取 rank（可能是 ranked tensor 或 MyTensorType）。
+      int64_t rank = 0;
+      auto dataTy = op.getData().getType();
+      if (auto tt = mlir::dyn_cast<mlir::RankedTensorType>(dataTy))
+        rank = tt.getRank();
+      else if (auto mtt = mlir::dyn_cast<mydialect::MyTensorType>(dataTy))
+        rank = mtt.getShape().size();
+      else
+        return failure();
+      llvm::SmallVector<mlir::Attribute> allAxes;
+      for (int64_t i = 0; i < rank; ++i)
+        allAxes.push_back(rewriter.getI64IntegerAttr(i));
+      axesAttr = rewriter.getArrayAttr(allAxes);
+    }
     BoolAttr keepDimsAttr = op.getKeepdimsAttr();
     if (!keepDimsAttr) keepDimsAttr = rewriter.getBoolAttr(false);
     auto data = castIfNeeded(converter, rewriter, op.getLoc(), op.getData());

@@ -119,8 +119,9 @@ LogicalResult CmpITensorOp::verify() {
     return emitOpError("lhs/rhs element type mismatch");
 
   int64_t pred = static_cast<int64_t>(getPredicate());
-  if (pred < 0 || pred > 6)
-    return emitOpError("invalid comparison predicate value");
+  // predicate 采用 arith::CmpIPredicate 枚举值 eq=0..uge=9
+  if (pred < 0 || pred > 9)
+    return emitOpError("invalid comparison predicate value (range 0..9)");
   return success();
 }
 
@@ -183,6 +184,23 @@ LogicalResult ReshapeTensorOp::verify() {
 
   if (shapeTy.getShape().size() != 1)
     return emitOpError("shape tensor must be rank-1");
+
+  // 元素总数守恒：data 和 res 必须表示相同数量的元素。
+  // 静态 shape 时在此处校验；动态 shape 交由运行时。
+  auto prod = [](auto shape) -> std::optional<int64_t> {
+    int64_t n = 1;
+    for (auto a : shape) {
+      int64_t d = llvm::cast<mlir::IntegerAttr>(a).getInt();
+      if (d < 0) return std::nullopt;
+      n *= d;
+    }
+    return n;
+  };
+  auto nd = prod(dataTy.getShape());
+  auto nr = prod(resTy.getShape());
+  if (nd && nr && *nd != *nr)
+    return emitOpError("data element count must equal result element count "
+                       "(reshape must preserve total elements)");
   return success();
 }
 
@@ -217,11 +235,25 @@ LogicalResult TransposeTensorOp::verify() {
   if (permAttr.size() != rank)
     return emitOpError("perm array length must equal tensor rank");
 
+  // perm 必须是 0..rank-1 的一个排列（无重复、全覆盖）
+  llvm::SmallDenseSet<int64_t, 8> seen;
   for (auto item : permAttr) {
     int64_t dimIdx = llvm::cast<mlir::IntegerAttr>(item).getInt();
     if (dimIdx < 0 || dimIdx >= rank)
       return emitOpError("transpose perm index out of range");
+    if (!seen.insert(dimIdx).second)
+      return emitOpError("transpose perm must be a permutation (no duplicates)");
   }
+
+  // 结果 shape 必须等于 data 按 perm 重排后的 shape
+  llvm::SmallVector<mlir::Attribute> newShapeAttrs;
+  for (auto item : permAttr) {
+    int64_t idx = llvm::cast<mlir::IntegerAttr>(item).getInt();
+    newShapeAttrs.push_back(dataTy.getShape()[idx]);
+  }
+  auto expectedShapeArr = mlir::ArrayAttr::get(dataTy.getContext(), newShapeAttrs);
+  if (resTy.getShape() != expectedShapeArr)
+    return emitOpError("result tensor shape must be the permuted shape of data");
   return success();
 }
 
@@ -261,11 +293,33 @@ LogicalResult ReduceSumTensorOp::verify() {
   if (!resTy) return emitOpError("result is not mydialect tensor");
 
   int64_t rank = dataTy.getShape().size();
+
+  // axes 必须在 rank 范围内且无重复
+  llvm::SmallDenseSet<int64_t, 8> seen;
   for (auto item : axesAttr) {
     int64_t axis = llvm::cast<mlir::IntegerAttr>(item).getInt();
     if (axis < 0 || axis >= rank)
       return emitOpError("reduce axis out of tensor rank range");
+    if (!seen.insert(axis).second)
+      return emitOpError("reduce axes must not contain duplicates");
   }
+
+  // 结果 shape 必须与 inferReturnTypes 推导出的一致
+  llvm::SmallVector<mlir::Attribute> outShapeAttrs;
+  bool keepDims = getKeepDims();
+  auto inShape = dataTy.getShape();
+  for (int64_t idx = 0; idx < rank; ++idx) {
+    bool isReduce = seen.contains(idx);
+    if (!isReduce) {
+      outShapeAttrs.push_back(inShape[idx]);
+    } else if (keepDims) {
+      outShapeAttrs.push_back(mlir::IntegerAttr::get(
+          mlir::IndexType::get(dataTy.getContext()), 1));
+    }
+  }
+  auto expectedShapeArr = mlir::ArrayAttr::get(dataTy.getContext(), outShapeAttrs);
+  if (resTy.getShape() != expectedShapeArr)
+    return emitOpError("result tensor shape does not match reduce axes/keep_dims");
   return success();
 }
 

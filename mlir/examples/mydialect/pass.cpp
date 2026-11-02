@@ -21,6 +21,38 @@
 #include "mlir/IR/SymbolTable.h"
 
 namespace {
+
+// ============ 公共 helper ============
+// 把 adaptor 操作数（可能仍是 MyTensorType，上游 op 未转换）补 cast 到 memref。
+static mlir::Value ensureMemref(mlir::Value v, const mlir::TypeConverter &tc,
+                                mlir::ConversionPatternRewriter &rw,
+                                mlir::Location loc) {
+  if (mlir::isa<mlir::MemRefType>(v.getType()))
+    return v;
+  return mlir::UnrealizedConversionCastOp::create(
+             rw, loc, tc.convertType(v.getType()), v)
+      .getResult(0);
+}
+
+// 按静态 shape 生成嵌套 scf.for；rank==0 时直接调用 body({})。
+// 函数内部持有 InsertionGuard，返回后插入点停留在循环 nest 之外。
+static void emitLoopNest(
+    mlir::ConversionPatternRewriter &rw, mlir::Location loc,
+    llvm::ArrayRef<int64_t> shape,
+    llvm::function_ref<void(llvm::ArrayRef<mlir::Value>)> body) {
+  mlir::OpBuilder::InsertionGuard guard(rw);
+  llvm::SmallVector<mlir::Value, 4> ivs;
+  for (int64_t d : shape) {
+    auto lb = mlir::arith::ConstantIndexOp::create(rw, loc, 0);
+    auto ub = mlir::arith::ConstantIndexOp::create(rw, loc, d);
+    auto st = mlir::arith::ConstantIndexOp::create(rw, loc, 1);
+    auto loop = mlir::scf::ForOp::create(rw, loc, lb, ub, st);
+    ivs.push_back(loop.getInductionVar());
+    rw.setInsertionPointToStart(loop.getBody());
+  }
+  body(ivs);
+}
+
 // ============ WrapOp: mydialect.wrap i32→wrapped_i32，降级时透传 ============
 // wrapped_i32 经 TypeConverter 转 i32，wrap 语义上就是 identity，直接替换
 struct WrapOpLowering : public mlir::OpConversionPattern<mydialect::WrapOp> {
@@ -747,51 +779,22 @@ struct AddTensorOpLowering
       mydialect::AddTensorOp op, mydialect::AddTensorOp::Adaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
     auto resTy = mlir::cast<mlir::MemRefType>(
-        getTypeConverter()->convertType(op.getRes().getType()));
-
-    // 防御：上游 op 未转换时 adaptor 可能仍是 MyTensorType，补 cast 到 memref
-    auto ensureMemref = [&](mlir::Value v) -> mlir::Value {
-      if (mlir::isa<mlir::MemRefType>(v.getType()))
-        return v;
-      return rewriter
-          .create<mlir::UnrealizedConversionCastOp>(
-              loc, getTypeConverter()->convertType(v.getType()), v)
-          .getResult(0);
-    };
-    mlir::Value lhs = ensureMemref(adaptor.getLhs());
-    mlir::Value rhs = ensureMemref(adaptor.getRhs());
-
+        tc.convertType(op.getRes().getType()));
+    mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
+    mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
     mlir::Type elemTy = resTy.getElementType();
-
-    // 在指定索引处生成 load lhs/rhs、相加、store 到 res
-    auto emitElementwise = [&](mlir::ValueRange idxs) {
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value sum;
-      if (mlir::isa<mlir::IntegerType>(elemTy))
-        sum = mlir::arith::AddIOp::create(rewriter, loc, lv, rv);
-      else
-        sum = mlir::arith::AddFOp::create(rewriter, loc, lv, rv);
+      mlir::Value sum = mlir::isa<mlir::IntegerType>(elemTy)
+        ? (mlir::Value)mlir::arith::AddIOp::create(rewriter, loc, lv, rv)
+        : (mlir::Value)mlir::arith::AddFOp::create(rewriter, loc, lv, rv);
       rewriter.create<mlir::memref::StoreOp>(loc, sum, res, idxs);
-    };
-
-    if (resTy.getRank() == 0) {
-      emitElementwise(mlir::ValueRange{});
-    } else {
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      llvm::SmallVector<mlir::Value, 4> ivs;
-      for (int64_t d : resTy.getShape()) {
-        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
-        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
-        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
-        ivs.push_back(loop.getInductionVar());
-        rewriter.setInsertionPointToStart(loop.getBody());
-      }
-      emitElementwise(ivs);
-    }
+    });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
@@ -808,51 +811,22 @@ struct MulTensorOpLowering
       mydialect::MulTensorOp op, mydialect::MulTensorOp::Adaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
     auto resTy = mlir::cast<mlir::MemRefType>(
-        getTypeConverter()->convertType(op.getRes().getType()));
-
-    // 防御：上游 op 未转换时 adaptor 可能仍是 MyTensorType，补 cast 到 memref
-    auto ensureMemref = [&](mlir::Value v) -> mlir::Value {
-      if (mlir::isa<mlir::MemRefType>(v.getType()))
-        return v;
-      return rewriter
-          .create<mlir::UnrealizedConversionCastOp>(
-              loc, getTypeConverter()->convertType(v.getType()), v)
-          .getResult(0);
-    };
-    mlir::Value lhs = ensureMemref(adaptor.getLhs());
-    mlir::Value rhs = ensureMemref(adaptor.getRhs());
-
+        tc.convertType(op.getRes().getType()));
+    mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
+    mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
     mlir::Type elemTy = resTy.getElementType();
-
-    // 在指定索引处生成 load lhs/rhs、相乘、store 到 res
-    auto emitElementwise = [&](mlir::ValueRange idxs) {
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value prod;
-      if (mlir::isa<mlir::IntegerType>(elemTy))
-        prod = mlir::arith::MulIOp::create(rewriter, loc, lv, rv);
-      else
-        prod = mlir::arith::MulFOp::create(rewriter, loc, lv, rv);
+      mlir::Value prod = mlir::isa<mlir::IntegerType>(elemTy)
+        ? (mlir::Value)mlir::arith::MulIOp::create(rewriter, loc, lv, rv)
+        : (mlir::Value)mlir::arith::MulFOp::create(rewriter, loc, lv, rv);
       rewriter.create<mlir::memref::StoreOp>(loc, prod, res, idxs);
-    };
-
-    if (resTy.getRank() == 0) {
-      emitElementwise(mlir::ValueRange{});
-    } else {
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      llvm::SmallVector<mlir::Value, 4> ivs;
-      for (int64_t d : resTy.getShape()) {
-        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
-        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
-        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
-        ivs.push_back(loop.getInductionVar());
-        rewriter.setInsertionPointToStart(loop.getBody());
-      }
-      emitElementwise(ivs);
-    }
+    });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
@@ -872,26 +846,15 @@ struct FusedElementwiseOpLowering
       mydialect::FusedElementwiseOp::Adaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
     auto resTy = mlir::cast<mlir::MemRefType>(
-        getTypeConverter()->convertType(op.getRes().getType()));
-
-    // 防御：上游 op 未转换时 adaptor 可能仍是 MyTensorType，补 cast 到 memref
-    auto ensureMemref = [&](mlir::Value v) -> mlir::Value {
-      if (mlir::isa<mlir::MemRefType>(v.getType()))
-        return v;
-      return rewriter
-          .create<mlir::UnrealizedConversionCastOp>(
-              loc, getTypeConverter()->convertType(v.getType()), v)
-          .getResult(0);
-    };
+        tc.convertType(op.getRes().getType()));
     llvm::SmallVector<mlir::Value> inputs;
     for (mlir::Value v : adaptor.getInputs())
-      inputs.push_back(ensureMemref(v));
-
+      inputs.push_back(ensureMemref(v, tc, rewriter, loc));
     auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
-
-    // 在指定索引处：load 各输入元素 → 内联 region 标量计算 → store 结果
-    auto emitElementwise = [&](mlir::ValueRange idxs) {
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::IRMapping mapping;
       mlir::Block &blk = op.getBody().front();
       for (auto [arg, in] : llvm::zip(blk.getArguments(), inputs)) {
@@ -908,23 +871,200 @@ struct FusedElementwiseOpLowering
         rewriter.clone(inner, mapping);
       }
       rewriter.create<mlir::memref::StoreOp>(loc, result, res, idxs);
-    };
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
 
-    if (resTy.getRank() == 0) {
-      emitElementwise(mlir::ValueRange{});
-    } else {
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      llvm::SmallVector<mlir::Value, 4> ivs;
-      for (int64_t d : resTy.getShape()) {
-        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
-        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
-        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
-        ivs.push_back(loop.getInductionVar());
-        rewriter.setInsertionPointToStart(loop.getBody());
+// ============ CmpITensorOp: mydialect.cmpi_tensor → memref 逐元素比较 ============
+// predicate 采用 arith::CmpIPredicate 枚举值（eq=0..uge=9），直接 static_cast。
+// 结果 memref 元素类型为 i1，逐元素 load-lhs/rhs → arith.cmpi → store。
+struct CmpITensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::CmpITensorOp> {
+  using mlir::OpConversionPattern<mydialect::CmpITensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::CmpITensorOp op, mydialect::CmpITensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+
+    // predicate 采用 arith::CmpIPredicate 枚举值（0..9）
+    int64_t predVal = op.getPredicate();
+    if (predVal < 0 || predVal > 9)
+      return rewriter.notifyMatchFailure(op, "invalid predicate range");
+    auto pred = static_cast<mlir::arith::CmpIPredicate>(predVal);
+
+    mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
+    mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
+      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
+      mlir::Value cmp = mlir::arith::CmpIOp::create(rewriter, loc, pred, lv, rv);
+      rewriter.create<mlir::memref::StoreOp>(loc, cmp, res, idxs);
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
+// ============ IdentityTensorOp: mydialect.identity_tensor → 零拷贝别名 ============
+// identity 语义即透传；verifier 已保证输入/结果类型相同。
+// 直接把 adaptor.getIn()（已是 memref 或经 ensureMemref cast）替换 op。
+struct IdentityTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::IdentityTensorOp> {
+  using mlir::OpConversionPattern<
+      mydialect::IdentityTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::IdentityTensorOp op,
+      mydialect::IdentityTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    // 注意：此处选择别名而非 memref.copy。
+    // 前提：当前 mydialect 除显式 memref.store 外不引入原地写算子，
+    // 多个别名指向同一 buffer 在当前 pass 下不会产生写冲突。
+    mlir::Value src = ensureMemref(adaptor.getIn(), tc, rewriter, loc);
+    rewriter.replaceOp(op, src);
+    return mlir::success();
+  }
+};
+
+// ============ ReshapeTensorOp: mydialect.reshape_tensor → memref.reinterpret_cast ============
+// reshape 语义是元素总数不变的布局重解释，结果 memref 与输入共享底层 buffer，
+// 只是 size/stride/offset 不同。降级时丢掉运行时 shape 操作数
+// （它的作用已由 IR 显式结果类型表达）。
+// 约束：src 与 res 的元素总数必须相等（由 ReshapeTensorOp::verify 保证）。
+// 注：src 的 layout 必须是 identity（本项目所有 memref 来自 memref.alloc），
+// reinterpret_cast 的 offset 语义才能正确。若将来引入带 offset/stride 的
+// 非 identity 视图，需要改为 memref.copy 或改用 collapse_shape/expand_shape。
+struct ReshapeTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::ReshapeTensorOp> {
+  using mlir::OpConversionPattern<
+      mydialect::ReshapeTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::ReshapeTensorOp op,
+      mydialect::ReshapeTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    if (!resTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(op, "dynamic shape not supported");
+    mlir::Value src = ensureMemref(adaptor.getData(), tc, rewriter, loc);
+
+    // 行主序 strides
+    llvm::SmallVector<int64_t> sizes(resTy.getShape().begin(),
+                                     resTy.getShape().end());
+    llvm::SmallVector<int64_t> strides(sizes.size(), 1);
+    for (int i = sizes.size() - 2; i >= 0; --i)
+      strides[i] = strides[i + 1] * sizes[i + 1];
+
+    auto view = mlir::memref::ReinterpretCastOp::create(
+        rewriter, loc, resTy, src, /*offset*/ int64_t{0}, sizes, strides);
+    rewriter.replaceOp(op, view.getResult());
+    return mlir::success();
+  }
+};
+
+// ============ TransposeTensorOp: mydialect.transpose_tensor → memref 转置拷贝 ============
+// 按 perm 属性生成循环：输出第 j 维迭代变量 iv 映射到输入第 perm[j] 维索引。
+// 0 维 / rank-1（perm=[0]）退化为单元素拷贝。
+struct TransposeTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::TransposeTensorOp> {
+  using mlir::OpConversionPattern<
+      mydialect::TransposeTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::TransposeTensorOp op,
+      mydialect::TransposeTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value src = ensureMemref(adaptor.getData(), tc, rewriter, loc);
+
+    llvm::SmallVector<int64_t> perm;
+    for (mlir::Attribute a : op.getPerm())
+      perm.push_back(mlir::cast<mlir::IntegerAttr>(a).getInt());
+
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> outIvs) {
+      llvm::SmallVector<mlir::Value> inIvs(perm.size());
+      for (auto [j, iv] : llvm::enumerate(outIvs))
+        inIvs[perm[j]] = iv;
+      mlir::Value v = rewriter.create<mlir::memref::LoadOp>(loc, src, inIvs);
+      rewriter.create<mlir::memref::StoreOp>(loc, v, res, outIvs);
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
+// ============ ReduceSumTensorOp: mydialect.reduce_sum_tensor → 清零 + 累加循环 ============
+// 两步法：
+//   1) 遍历输出 shape 所有元素写零（memref.alloc 不保证零初始化）；
+//   2) 遍历输入 shape，把每个输入元素累加到对应的输出槽
+//      （被归约维用 0，保留维直接用输入索引）。
+// 单线程下每个输出元素只被一个线程写，无需 atomic。
+struct ReduceSumTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::ReduceSumTensorOp> {
+  using mlir::OpConversionPattern<
+      mydialect::ReduceSumTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::ReduceSumTensorOp op,
+      mydialect::ReduceSumTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value src = ensureMemref(adaptor.getData(), tc, rewriter, loc);
+    auto srcTy = mlir::cast<mlir::MemRefType>(src.getType());
+    mlir::Type elemTy = resTy.getElementType();
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+
+    bool keepDims = op.getKeepDims();
+    llvm::SmallDenseSet<int64_t> axes;
+    for (mlir::Attribute a : op.getAxes())
+      axes.insert(mlir::cast<mlir::IntegerAttr>(a).getInt());
+
+    // 1) 清零（memref.alloc 不保证零初始化）
+    auto zero = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(elemTy));
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> outIvs) {
+      rewriter.create<mlir::memref::StoreOp>(loc, zero, res, outIvs);
+    });
+
+    // 2) 按输入遍历累加
+    auto c0 = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+    int64_t srcRank = srcTy.getRank();
+    llvm::SmallVector<int64_t> srcShape(srcTy.getShape().begin(),
+                                         srcTy.getShape().end());
+    emitLoopNest(rewriter, loc, srcShape,
+                 [&](llvm::ArrayRef<mlir::Value> inIvs) {
+      llvm::SmallVector<mlir::Value> outIvs;
+      for (int64_t d = 0; d < srcRank; ++d) {
+        if (axes.contains(d)) {
+          if (keepDims) outIvs.push_back(c0.getResult());
+        } else {
+          outIvs.push_back(inIvs[d]);
+        }
       }
-      emitElementwise(ivs);
-    }
+      mlir::Value v   = rewriter.create<mlir::memref::LoadOp>(loc, src, inIvs);
+      mlir::Value acc = rewriter.create<mlir::memref::LoadOp>(loc, res, outIvs);
+      mlir::Value sum = mlir::isa<mlir::IntegerType>(elemTy)
+        ? (mlir::Value)mlir::arith::AddIOp::create(rewriter, loc, acc, v)
+        : (mlir::Value)mlir::arith::AddFOp::create(rewriter, loc, acc, v);
+      rewriter.create<mlir::memref::StoreOp>(loc, sum, res, outIvs);
+    });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
@@ -1116,6 +1256,11 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
 	AddTensorOpLowering,
 	MulTensorOpLowering,
 	FusedElementwiseOpLowering,
+	CmpITensorOpLowering,
+	IdentityTensorOpLowering,
+	ReshapeTensorOpLowering,
+	TransposeTensorOpLowering,
+	ReduceSumTensorOpLowering,
 	LoopOpLowering,
 	TensorToScalarOpLowering,
 	ScalarToTensorOpLowering>(converter, patterns.getContext());
