@@ -194,6 +194,38 @@ def ReduceSumTensorOp : Op<MyDialect, "reduce_sum_tensor", [
   let assemblyFormat = "$data `,` $axes `,` $keep_dims attr-dict `:` type($data) `->` type($res)";
 }
 
+//===================== 张量逐元素 Relu relu_tensor =====================
+// 逐元素 max(0, x)。LowerMyDialectPrint 里展开为循环 nest + 标量：
+//   整数: arith.cmpi sgt(x, 0) + arith.select(x, 0, flag)
+//   浮点: arith.cmpi ogt(x, 0.0) + arith.select(x, 0.0, flag)
+// 注：本方言的 Arith dialect 没有 arith.maxsi/maxf，所以用 cmpi+select 组合。
+def ReluTensorOp : Op<MyDialect, "relu_tensor", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins MyTensorType:$x);
+  let results = (outs MyTensorType:$res);
+  let assemblyFormat = "$x attr-dict `:` type($res)";
+}
+
+//===================== 张量矩阵乘法 matmul_tensor =====================
+// 语义：Y[m,n] = Σ_k A[m,k] * B[k,n]，A: [M,K], B: [K,N] → Y: [M,N]。
+// 简化实现：先要求 rank=2（不支持 batched matmul），静态 shape。
+// 结果 shape 由 A.shape[0] + B.shape[1] 推导，需手写 inferReturnTypes。
+def MatMulTensorOp : Op<MyDialect, "matmul_tensor", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>
+]> {
+  let arguments = (ins
+    MyTensorType:$A,
+    MyTensorType:$B
+  );
+  let results = (outs MyTensorType:$Y);
+  let hasVerifier = 1;
+  let assemblyFormat = "$A `,` $B attr-dict `:` type($A) `,` type($B) `->` type($Y)";
+}
+
+
 // ===================== 循环算子：对标 ONNX Loop =====================
 // 注意：本算子不同于 mydialect.td 中既有的标量 ForOp/YieldOp，必须使用
 // 独立的 def 名称与 mnemonic，否则 TableGen 会报 "def already exists"。

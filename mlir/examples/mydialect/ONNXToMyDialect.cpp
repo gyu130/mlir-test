@@ -192,6 +192,51 @@ private:
   mlir::TypeConverter &converter;
 };
 
+// ONNX.Relu -> mydialect.relu_tensor
+struct ConvertONNXRelu : public mlir::OpRewritePattern<mlir::onnx::ONNXReluOp> {
+  ConvertONNXRelu(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXReluOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getResult().getType());
+    if (!outTy) return failure();
+    auto x = castIfNeeded(converter, rewriter, op.getLoc(), op.getX());
+    rewriter.replaceOpWithNewOp<mydialect::ReluTensorOp>(op, outTy, x);
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
+// ONNX.MatMul -> mydialect.matmul_tensor
+// 先只支持 rank=2 基本情况（batched + broadcast 后续扩展）。
+// 若 onnx-mlir 传入 batched（rank=3+），此处返回 failure 让 op 保留。
+struct ConvertONNXMatMul : public mlir::OpRewritePattern<mlir::onnx::ONNXMatMulOp> {
+  ConvertONNXMatMul(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXMatMulOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto aTy = converter.convertType(op.getA().getType());
+    auto bTy = converter.convertType(op.getB().getType());
+    auto yTy = converter.convertType(op.getResult().getType());
+    if (!aTy || !bTy || !yTy) return failure();
+    auto aMTy = mlir::dyn_cast<mydialect::MyTensorType>(aTy);
+    auto bMTy = mlir::dyn_cast<mydialect::MyTensorType>(bTy);
+    auto yMTy = mlir::dyn_cast<mydialect::MyTensorType>(yTy);
+    if (!aMTy || !bMTy || !yMTy) return failure();
+    // 先只支持 rank-2
+    if (aMTy.getShape().size() != 2 || bMTy.getShape().size() != 2) {
+      return rewriter.notifyMatchFailure(op, "matmul_tensor currently requires rank-2");
+    }
+    auto a = castIfNeeded(converter, rewriter, op.getLoc(), op.getA());
+    auto b = castIfNeeded(converter, rewriter, op.getLoc(), op.getB());
+    rewriter.replaceOpWithNewOp<mydialect::MatMulTensorOp>(op, yMTy, a, b);
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
 // ONNX.Equal -> mydialect.cmpi_tensor
 // predicate 采用 arith::CmpIPredicate 枚举值：eq=0
 struct ConvertONNXEqual : public mlir::OpRewritePattern<mlir::onnx::ONNXEqualOp> {
@@ -508,6 +553,8 @@ void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
   patterns.add<ConvertONNXMul>(ctx, typeConverter);
   patterns.add<ConvertONNXSub>(ctx, typeConverter);
   patterns.add<ConvertONNXDiv>(ctx, typeConverter);
+  patterns.add<ConvertONNXRelu>(ctx, typeConverter);
+  patterns.add<ConvertONNXMatMul>(ctx, typeConverter);
   patterns.add<ConvertONNXEqual>(ctx, typeConverter);
   patterns.add<ConvertONNXConstant>(ctx, typeConverter);
   patterns.add<ConvertONNXIdentity>(ctx, typeConverter);

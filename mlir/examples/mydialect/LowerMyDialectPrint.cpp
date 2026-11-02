@@ -147,6 +147,8 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::ReshapeTensorOp>();
     target.addIllegalOp<mydialect::TransposeTensorOp>();
     target.addIllegalOp<mydialect::ReduceSumTensorOp>();
+    target.addIllegalOp<mydialect::ReluTensorOp>();
+    target.addIllegalOp<mydialect::MatMulTensorOp>();
     // SimpleCParser 桥接 op：由 pass.cpp 里的 TensorToScalarOpLowering /
     // ScalarToTensorOpLowering 转成 memref.load / memref.alloc+store
     target.addIllegalOp<mydialect::TensorToScalarOp>();

@@ -153,4 +153,24 @@ def ONNXEntryPointOp : Op<OnnxDialect, "EntryPoint", []> {
   let results = (outs);
 }
 
+// ONNX Relu: 逐元素 max(0, x)，SameOperandsAndResultType
+def ONNXReluOp : Op<OnnxDialect, "Relu", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins AnyTensor:$x);
+  let results = (outs AnyTensor:$y);
+  let assemblyFormat = "$x attr-dict `:` type($x)";
+}
+
+// ONNX MatMul: 2D 矩阵乘法（扩展 batched）
+// 简化 stub：直接用 SameOperandsAndResultType（结果类型由 pattern 显式构造）。
+// 真实 ONNX MatMul 支持 batched + broadcast，此 stub 先覆盖 rank=2 基本情况。
+def ONNXMatMulOp : Op<OnnxDialect, "MatMul", [Pure]> {
+  let arguments = (ins AnyTensor:$A, AnyTensor:$B);
+  let results = (outs AnyTensor:$Y);
+  let assemblyFormat = "$A `,` $B attr-dict `:` type($A) `,` type($B) `->` type($Y)";
+}
+
 #endif // ONNX_OPS_TD
+

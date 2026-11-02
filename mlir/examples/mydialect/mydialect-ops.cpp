@@ -386,6 +386,51 @@ LogicalResult LoopOp::verify() {
   return success();
 }
 
+// ---------------- MatMulTensorOp ----------------
+static int64_t shapeAt(mydialect::MyTensorType t, size_t i) {
+  return mlir::cast<mlir::IntegerAttr>(t.getShape()[i]).getInt();
+}
+
+llvm::LogicalResult MatMulTensorOp::inferReturnTypes(
+    mlir::MLIRContext *ctx, std::optional<mlir::Location> loc,
+    mlir::ValueRange operands, mlir::DictionaryAttr attrs,
+    mlir::OpaqueProperties properties, mlir::RegionRange regions,
+    mlir::SmallVectorImpl<mlir::Type> &inferredReturnTypes) {
+  if (operands.size() < 2) return mlir::failure();
+  auto aTy = llvm::dyn_cast<mydialect::MyTensorType>(operands[0].getType());
+  auto bTy = llvm::dyn_cast<mydialect::MyTensorType>(operands[1].getType());
+  if (!aTy || !bTy) return mlir::failure();
+  if (aTy.getShape().size() != 2 || bTy.getShape().size() != 2)
+    return mlir::failure();
+  if (shapeAt(aTy, 1) != shapeAt(bTy, 0)) return mlir::failure();
+  llvm::SmallVector<mlir::Attribute> outShape = {
+    mlir::IntegerAttr::get(mlir::IndexType::get(ctx), shapeAt(aTy, 0)),
+    mlir::IntegerAttr::get(mlir::IndexType::get(ctx), shapeAt(bTy, 1))};
+  inferredReturnTypes.push_back(mydialect::MyTensorType::get(
+      ctx, mlir::ArrayAttr::get(ctx, outShape), aTy.getElementType()));
+  return mlir::success();
+}
+
+LogicalResult MatMulTensorOp::verify() {
+  auto aTy = llvm::dyn_cast<mydialect::MyTensorType>(getA().getType());
+  auto bTy = llvm::dyn_cast<mydialect::MyTensorType>(getB().getType());
+  auto yTy = llvm::dyn_cast<mydialect::MyTensorType>(getY().getType());
+  if (!aTy || !bTy || !yTy)
+    return emitOpError("operands/result must be MyTensorType");
+  if (aTy.getShape().size() != 2 || bTy.getShape().size() != 2)
+    return emitOpError("matmul_tensor currently requires rank-2 inputs");
+  if (shapeAt(aTy, 1) != shapeAt(bTy, 0))
+    return emitOpError("inner dimension K mismatch for matmul");
+  if (yTy.getShape().size() != 2)
+    return emitOpError("matmul result must be rank-2");
+  if (shapeAt(yTy, 0) != shapeAt(aTy, 0) || shapeAt(yTy, 1) != shapeAt(bTy, 1))
+    return emitOpError("matmul result shape must be [M, N]");
+  if (aTy.getElementType() != bTy.getElementType() ||
+      aTy.getElementType() != yTy.getElementType())
+    return emitOpError("element types must match");
+  return success();
+}
+
 // ---------------- LoopYieldOp ----------------
 LogicalResult LoopYieldOp::verify() {
   // cond：接受 i1 标量 或 0维 tensor<i1>
