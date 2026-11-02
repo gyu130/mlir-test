@@ -155,6 +155,7 @@ def ForOp : Op<MyDialect, "for"> {
   // 自定义汇编格式（parse/print 在 MyDialect.cpp 中实现）
   let hasCustomAssemblyFormat = 1;
   let hasFolder = 1;
+  let hasVerifier = 1;
 
   let extraClassDeclaration = [{
     mlir::Value getInductionVar();

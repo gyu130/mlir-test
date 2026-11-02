@@ -1,6 +1,7 @@
 #include "MyDialectOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Types.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -320,6 +321,22 @@ LogicalResult ReduceSumTensorOp::verify() {
   auto expectedShapeArr = mlir::ArrayAttr::get(dataTy.getContext(), outShapeAttrs);
   if (resTy.getShape() != expectedShapeArr)
     return emitOpError("result tensor shape does not match reduce axes/keep_dims");
+  return success();
+}
+
+// ---------------- ForOp ----------------
+LogicalResult ForOp::verify() {
+  // step≠0 静态校验：若 step 是 arith.ConstantOp，且值为 0，则拒绝。
+  // step=0 时 scf.for 将永不推进，是 UB（运行时无界循环或除零语义）。
+  // 动态 step（非常量）不做校验，由运行时/其他 pass 处理。
+  if (auto constOp = mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(
+          getStep().getDefiningOp())) {
+    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(
+            constOp.getValue())) {
+      if (intAttr.getInt() == 0)
+        return emitOpError("step must not be zero");
+    }
+  }
   return success();
 }
 
