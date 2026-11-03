@@ -92,7 +92,6 @@ struct OnnxToMyDialectTypeConverter : public mlir::TypeConverter {
     // 单规则：优先 RankedTensorType → MyTensorType，其余 identity
     addConversion([](mlir::Type ty) -> std::optional<mlir::Type> {
       if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(ty)) {
-        if (!rtt.hasStaticShape()) return std::nullopt;
         auto ctx = ty.getContext();
         SmallVector<mlir::Attribute> shapeAttrVec;
         for (int64_t dim : rtt.getShape())

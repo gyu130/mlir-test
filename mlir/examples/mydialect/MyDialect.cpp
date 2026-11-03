@@ -72,9 +72,13 @@ mlir::Type mydialect::MyTensorType::parse(mlir::AsmParser &parser) {
   if (failed(parser.parseOptionalRSquare())) {
     do {
       int64_t v;
-      if (parser.parseInteger(v))
+      if (succeeded(parser.parseOptionalQuestion())) {
+        dims.push_back(mlir::ShapedType::kDynamic);
+      } else if (succeeded(parser.parseInteger(v))) {
+        dims.push_back(v);
+      } else {
         return nullptr;
-      dims.push_back(v);
+      }
     } while (succeeded(parser.parseOptionalComma()));
     if (parser.parseRSquare())
       return nullptr;
@@ -116,7 +120,11 @@ void mydialect::MyTensorType::print(mlir::AsmPrinter &printer) const {
   for (size_t i = 0; i < shapeAttr.size(); i++) {
     if (i > 0) printer << ",";
     auto intAttr = mlir::cast<mlir::IntegerAttr>(shapeAttr[i]);
-    printer << intAttr.getInt();
+    int64_t d = intAttr.getInt();
+    if (mlir::ShapedType::isDynamic(d))
+      printer << "?";
+    else
+      printer << d;
   }
   printer << "], " << getElementType() << ">";
 }
@@ -287,31 +295,45 @@ mlir::LogicalResult CmpiOp::verify() {
 }
 
 // ---- AllocOp verify ----
+// 支持任意 rank；尺寸操作数个数必须等于结果 memref 的动态维度个数
 mlir::LogicalResult AllocOp::verify() {
   auto memRefType = mlir::cast<mlir::MemRefType>(getRes().getType());
-  if(memRefType.getRank() != 1)
-    return emitError() << "alloc only support 1-D memref";
-  if(memRefType.getElementType() != mlir::IntegerType::get(getContext(), 32))
+  if (memRefType.getElementType() != mlir::IntegerType::get(getContext(), 32))
     return emitError() << "alloc only support i32 element";
+
+  size_t numDynamicDims = 0;
+  for (int64_t d : memRefType.getShape())
+    if (mlir::ShapedType::isDynamic(d))
+      ++numDynamicDims;
+  if (getSizes().size() != numDynamicDims)
+    return emitError() << "alloc expects " << numDynamicDims
+                       << " size operand(s) for " << memRefType.getRank()
+                       << "-D memref, but got " << getSizes().size();
   return mlir::success();
 }
 
 // ---- LoadOp verify ----
+// 支持任意 rank；索引个数必须等于 memref rank
 mlir::LogicalResult LoadOp::verify() {
   auto mty = mlir::cast<mlir::MemRefType>(getMemref().getType());
-  if(mty.getRank() != 1)
-    return emitError() << "load only support 1-D memref";
-  if(mty.getElementType() != getRes().getType())
+  if (getIndices().size() != static_cast<size_t>(mty.getRank()))
+    return emitError() << "load expects " << mty.getRank()
+                       << " index(es) for " << mty.getRank()
+                       << "-D memref, but got " << getIndices().size();
+  if (mty.getElementType() != getRes().getType())
     return emitError() << "load element type mismatch";
   return mlir::success();
 }
 
 // ---- StoreOp verify ----
+// 支持任意 rank；索引个数必须等于 memref rank
 mlir::LogicalResult StoreOp::verify() {
   auto mty = mlir::cast<mlir::MemRefType>(getMemref().getType());
-  if(mty.getRank() != 1)
-    return emitError() << "store only support 1-D memref";
-  if(mty.getElementType() != getValue().getType())
+  if (getIndices().size() != static_cast<size_t>(mty.getRank()))
+    return emitError() << "store expects " << mty.getRank()
+                       << " index(es) for " << mty.getRank()
+                       << "-D memref, but got " << getIndices().size();
+  if (mty.getElementType() != getValue().getType())
     return emitError() << "store element type mismatch";
   return mlir::success();
 }

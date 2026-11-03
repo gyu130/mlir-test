@@ -54,6 +54,53 @@ static void emitLoopNest(
   body(ivs);
 }
 
+// 取 memref 某一维的上界：静态形状直接返回 arith.constant；
+// 动态形状用 memref.dim 在运行时取值。
+static mlir::Value getMemrefDim(mlir::ConversionPatternRewriter &rw,
+                                mlir::Location loc, mlir::Value memref,
+                                int64_t dimIdx) {
+  auto ty = mlir::cast<mlir::MemRefType>(memref.getType());
+  int64_t dimSize = ty.getDimSize(dimIdx);
+  if (!mlir::ShapedType::isDynamic(dimSize))
+    return mlir::arith::ConstantIndexOp::create(rw, loc, dimSize);
+  auto idxVal = mlir::arith::ConstantIndexOp::create(rw, loc, dimIdx);
+  return mlir::memref::DimOp::create(rw, loc, memref, idxVal);
+}
+
+// 从 memref Value 出发生成嵌套 scf.for；每维上界静态时 constant、
+// 动态时 memref.dim。rank==0 时直接调 body({})。
+// 这是动态 shape 友好的版本；静态 shape 也走它，等价于原 emitLoopNest。
+static void emitLoopNestMemref(
+    mlir::ConversionPatternRewriter &rw, mlir::Location loc,
+    mlir::Value memref,
+    llvm::function_ref<void(llvm::ArrayRef<mlir::Value>)> body) {
+  auto ty = mlir::cast<mlir::MemRefType>(memref.getType());
+  mlir::OpBuilder::InsertionGuard guard(rw);
+  llvm::SmallVector<mlir::Value, 4> ivs;
+  for (int64_t d = 0, rank = ty.getRank(); d < rank; ++d) {
+    auto lb = mlir::arith::ConstantIndexOp::create(rw, loc, 0);
+    auto ub = getMemrefDim(rw, loc, memref, d);
+    auto st = mlir::arith::ConstantIndexOp::create(rw, loc, 1);
+    auto loop = mlir::scf::ForOp::create(rw, loc, lb, ub, st);
+    ivs.push_back(loop.getInductionVar());
+    rw.setInsertionPointToStart(loop.getBody());
+  }
+  body(ivs);
+}
+
+// 分配结果 memref：如果 resTy 含动态维度，从 src（通常是其中一个输入 memref）
+// 取各动态维度的运行时值传给 alloc。静态 shape 下 src 可忽略。
+static mlir::memref::AllocOp allocMemrefLike(
+    mlir::ConversionPatternRewriter &rw, mlir::Location loc,
+    mlir::MemRefType resTy, mlir::Value srcForDims) {
+  llvm::SmallVector<mlir::Value, 4> dynamicSizes;
+  for (int64_t d = 0, rank = resTy.getRank(); d < rank; ++d) {
+    if (mlir::ShapedType::isDynamic(resTy.getDimSize(d)))
+      dynamicSizes.push_back(getMemrefDim(rw, loc, srcForDims, d));
+  }
+  return mlir::memref::AllocOp::create(rw, loc, resTy, dynamicSizes);
+}
+
 // ============ WrapOp: mydialect.wrap i32→wrapped_i32，降级时透传 ============
 // wrapped_i32 经 TypeConverter 转 i32，wrap 语义上就是 identity，直接替换
 struct WrapOpLowering : public mlir::OpConversionPattern<mydialect::WrapOp> {
@@ -98,28 +145,15 @@ struct PrintOpLowering : public mlir::OpConversionPattern<mydialect::PrintOp> {
     mlir::Value val = adaptor.getValue();
 
     // ---- tensor 类型（converter 已把 MyTensorType 转为 memref）----
-    // 逐元素打印：按静态 shape 生成嵌套 scf.for，body 内 memref.load
+    // 逐元素打印：用 emitLoopNestMemref 生成嵌套 scf.for
+    // （动态 shape 时 ub 用 memref.dim 运行时取值），body 内 memref.load
     // 后调用 my_runtime_print_i32
     if (auto memrefTy = mlir::dyn_cast<mlir::MemRefType>(val.getType())) {
-      if (llvm::any_of(memrefTy.getShape(), [](int64_t d) {
-            return mlir::ShapedType::isDynamic(d);
-          }))
-        return rewriter.notifyMatchFailure(op,
-                                           "print: dynamic shape not supported");
-
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      llvm::SmallVector<mlir::Value, 4> ivs;
-      for (int64_t d : memrefTy.getShape()) {
-        auto lb = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
-        auto ub = mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
-        auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-        auto loop = mlir::scf::ForOp::create(rewriter, loc, lb, ub, step);
-        ivs.push_back(loop.getInductionVar());
-        // 下一层循环/最终 load 都建在本层 body 内
-        rewriter.setInsertionPointToStart(loop.getBody());
-      }
-      mlir::Value elem = rewriter.create<mlir::memref::LoadOp>(loc, val, ivs);
-      mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, elem);
+      emitLoopNestMemref(rewriter, loc, val,
+                         [&](llvm::ArrayRef<mlir::Value> idxs) {
+        mlir::Value elem = rewriter.create<mlir::memref::LoadOp>(loc, val, idxs);
+        mlir::LLVM::CallOp::create(rewriter, loc, mlir::TypeRange{}, sym, elem);
+      });
       rewriter.eraseOp(op);
       return mlir::success();
     }
@@ -627,11 +661,13 @@ struct MyAllocToMemRef : public mlir::OpConversionPattern<mydialect::AllocOp> {
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto memTy = mlir::cast<mlir::MemRefType>(op.getRes().getType());
-    // memref.alloca 的 size 操作数要求 index 类型，先做 i32→index 转换
-    auto indexSize = rewriter.create<mlir::arith::IndexCastOp>(
-        loc, rewriter.getIndexType(), adaptor.getSize());
+    // memref.alloca 的尺寸操作数要求 index 类型，逐个做 i32→index 转换
+    llvm::SmallVector<mlir::Value, 4> indexSizes;
+    for (auto size : adaptor.getSizes())
+      indexSizes.push_back(rewriter.create<mlir::arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), size));
     auto newAlloc = rewriter.create<mlir::memref::AllocaOp>(
-        loc, memTy, mlir::ValueRange{indexSize});
+        loc, memTy, mlir::ValueRange{indexSizes});
     rewriter.replaceOp(op, newAlloc.getResult());
     return mlir::success();
   }
@@ -643,11 +679,13 @@ struct MyLoadToMemRef : public mlir::OpConversionPattern<mydialect::LoadOp> {
       mydialect::LoadOp op, mydialect::LoadOp::Adaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    // memref.load 的 index 操作数要求 index 类型
-    auto indexVar = rewriter.create<mlir::arith::IndexCastOp>(
-        loc, rewriter.getIndexType(), adaptor.getIndex());
+    // memref.load 的每个索引操作数要求 index 类型
+    llvm::SmallVector<mlir::Value, 4> indexVars;
+    for (auto idx : adaptor.getIndices())
+      indexVars.push_back(rewriter.create<mlir::arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), idx));
     auto load = rewriter.create<mlir::memref::LoadOp>(
-        loc, adaptor.getMemref(), mlir::ValueRange{indexVar});
+        loc, adaptor.getMemref(), mlir::ValueRange{indexVars});
     rewriter.replaceOp(op, load.getResult());
     return mlir::success();
   }
@@ -659,12 +697,14 @@ struct MyStoreToMemRef : public mlir::OpConversionPattern<mydialect::StoreOp> {
       mydialect::StoreOp op, mydialect::StoreOp::Adaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    // memref.store 的 index 操作数要求 index 类型
-    auto indexVar = rewriter.create<mlir::arith::IndexCastOp>(
-        loc, rewriter.getIndexType(), adaptor.getIndex());
+    // memref.store 的每个索引操作数要求 index 类型
+    llvm::SmallVector<mlir::Value, 4> indexVars;
+    for (auto idx : adaptor.getIndices())
+      indexVars.push_back(rewriter.create<mlir::arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), idx));
     rewriter.create<mlir::memref::StoreOp>(
         loc, adaptor.getValue(), adaptor.getMemref(),
-        mlir::ValueRange{indexVar});
+        mlir::ValueRange{indexVars});
     rewriter.eraseOp(op);
     return mlir::success();
   }
@@ -785,9 +825,9 @@ struct AddTensorOpLowering
         tc.convertType(op.getRes().getType()));
     mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
@@ -817,9 +857,9 @@ struct MulTensorOpLowering
         tc.convertType(op.getRes().getType()));
     mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
@@ -846,9 +886,9 @@ struct SubTensorOpLowering
         tc.convertType(op.getRes().getType()));
     mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
@@ -876,9 +916,9 @@ struct DivTensorOpLowering
         tc.convertType(op.getRes().getType()));
     mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
@@ -912,8 +952,8 @@ struct FusedElementwiseOpLowering
     llvm::SmallVector<mlir::Value> inputs;
     for (mlir::Value v : adaptor.getInputs())
       inputs.push_back(ensureMemref(v, tc, rewriter, loc));
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    auto res = allocMemrefLike(rewriter, loc, resTy, inputs.front());
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::IRMapping mapping;
       mlir::Block &blk = op.getBody().front();
@@ -959,8 +999,8 @@ struct CmpITensorOpLowering
 
     mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
       mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
@@ -1053,8 +1093,8 @@ struct TransposeTensorOpLowering
     for (mlir::Attribute a : op.getPerm())
       perm.push_back(mlir::cast<mlir::IntegerAttr>(a).getInt());
 
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    auto res = allocMemrefLike(rewriter, loc, resTy, src);
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> outIvs) {
       llvm::SmallVector<mlir::Value> inIvs(perm.size());
       for (auto [j, iv] : llvm::enumerate(outIvs))
@@ -1088,7 +1128,7 @@ struct ReduceSumTensorOpLowering
     mlir::Value src = ensureMemref(adaptor.getData(), tc, rewriter, loc);
     auto srcTy = mlir::cast<mlir::MemRefType>(src.getType());
     mlir::Type elemTy = resTy.getElementType();
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, src);
 
     bool keepDims = op.getKeepDims();
     llvm::SmallDenseSet<int64_t> axes;
@@ -1098,7 +1138,7 @@ struct ReduceSumTensorOpLowering
     // 1) 清零（memref.alloc 不保证零初始化）
     auto zero = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getZeroAttr(elemTy));
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> outIvs) {
       rewriter.create<mlir::memref::StoreOp>(loc, zero, res, outIvs);
     });
@@ -1145,10 +1185,10 @@ struct ReluTensorOpLowering
     auto resTy = mlir::cast<mlir::MemRefType>(
         tc.convertType(op.getRes().getType()));
     mlir::Value src = ensureMemref(adaptor.getX(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, src);
     mlir::Type elemTy = resTy.getElementType();
 
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
       mlir::Value zero;
@@ -1203,12 +1243,12 @@ struct MatMulTensorOpLowering
     int64_t N = bTy.getShape()[1];
     mlir::Type elemTy = resTy.getElementType();
 
-    auto Y = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto Y = allocMemrefLike(rewriter, loc, resTy, A);
     auto zeroVal = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getZeroAttr(elemTy));
 
     // 1) 清零 Y（M*N 次，用 emitLoopNest 两层）
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, Y,
                  [&](llvm::ArrayRef<mlir::Value> mnIvs) {
       rewriter.create<mlir::memref::StoreOp>(loc, zeroVal, Y, mnIvs);
     });
@@ -1437,7 +1477,7 @@ struct ReduceMaxTensorOpLowering
     mlir::Value src = ensureMemref(adaptor.getData(), tc, rewriter, loc);
     auto srcTy = mlir::cast<mlir::MemRefType>(src.getType());
     mlir::Type elemTy = resTy.getElementType();
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto res = allocMemrefLike(rewriter, loc, resTy, src);
 
     bool keepDims = op.getKeepDims();
     llvm::SmallDenseSet<int64_t> axes;
@@ -1457,7 +1497,7 @@ struct ReduceMaxTensorOpLowering
     } else {
       return rewriter.notifyMatchFailure(op, "unsupported element type for reduce_max");
     }
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> outIvs) {
       rewriter.create<mlir::memref::StoreOp>(loc, initVal, res, outIvs);
     });
@@ -1509,8 +1549,8 @@ struct ExpTensorOpLowering
     auto resTy = mlir::cast<mlir::MemRefType>(
         tc.convertType(op.getRes().getType()));
     mlir::Value src = ensureMemref(adaptor.getX(), tc, rewriter, loc);
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
-    emitLoopNest(rewriter, loc, resTy.getShape(),
+    auto res = allocMemrefLike(rewriter, loc, resTy, src);
+    emitLoopNestMemref(rewriter, loc, res,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       mlir::Value x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
       mlir::Value ex = rewriter.create<mlir::math::ExpOp>(loc, x);
@@ -1537,11 +1577,6 @@ struct ConcatTensorOpLowering
     const auto &tc = *getTypeConverter();
     auto resTy = mlir::cast<mlir::MemRefType>(
         tc.convertType(op.getRes().getType()));
-    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
-    auto rank = (int64_t)resTy.getRank();
-
-    int64_t rawAxis = (int64_t)op.getAxis();
-    int64_t axis = rawAxis < 0 ? rawAxis + rank : rawAxis;
 
     // 先把每个输入转成 memref
     llvm::SmallVector<mlir::Value> srcs;
@@ -1550,6 +1585,17 @@ struct ConcatTensorOpLowering
     }
     if (srcs.empty())
       return rewriter.notifyMatchFailure(op, "no inputs to concat");
+
+    auto res = allocMemrefLike(rewriter, loc, resTy, srcs.front());
+    auto rank = (int64_t)resTy.getRank();
+
+    int64_t rawAxis = (int64_t)op.getAxis();
+    int64_t axis = rawAxis < 0 ? rawAxis + rank : rawAxis;
+
+    // 当前 lowering 不支持动态 axis 维（offset 累加需要运行时值，改造复杂）
+    if (mlir::ShapedType::isDynamic(resTy.getDimSize(axis)))
+      return rewriter.notifyMatchFailure(op,
+          "concat: dynamic axis dim not supported in lowering");
 
     int64_t offset = 0;
     auto c0 = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
@@ -1612,7 +1658,7 @@ struct Conv2dTensorOpLowering
     auto inputTy = mlir::cast<mlir::MemRefType>(input.getType());
     auto weightTy = mlir::cast<mlir::MemRefType>(weight.getType());
     mlir::Type elemTy = resTy.getElementType();
-    auto out = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto out = allocMemrefLike(rewriter, loc, resTy, input);
 
     int64_t N = inputTy.getShape()[0];
     int64_t C_in = inputTy.getShape()[1];
@@ -1756,7 +1802,7 @@ struct SoftmaxTensorOpLowering
     mlir::Value src = ensureMemref(adaptor.getX(), tc, rewriter, loc);
     auto srcTy = mlir::cast<mlir::MemRefType>(src.getType());
     mlir::Type elemTy = resTy.getElementType();
-    auto out = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto out = allocMemrefLike(rewriter, loc, resTy, src);
 
     int64_t rank = (int64_t)srcTy.getRank();
     int64_t rawAxis = (int64_t)op.getAxis();
@@ -1767,8 +1813,8 @@ struct SoftmaxTensorOpLowering
     for (int64_t d = 0; d < rank; ++d)
       reducedShape.push_back(d == axis ? 1 : srcTy.getShape()[d]);
     auto reducedMemrefTy = mlir::MemRefType::get(reducedShape, elemTy);
-    auto maxBuf = rewriter.create<mlir::memref::AllocOp>(loc, reducedMemrefTy);
-    auto sumBuf = rewriter.create<mlir::memref::AllocOp>(loc, reducedMemrefTy);
+    auto maxBuf = allocMemrefLike(rewriter, loc, reducedMemrefTy, src);
+    auto sumBuf = allocMemrefLike(rewriter, loc, reducedMemrefTy, src);
 
     // 构造 buf 的索引：axis 维固定 0
     auto c0idx = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
@@ -1794,14 +1840,14 @@ struct SoftmaxTensorOpLowering
     } else {
       return rewriter.notifyMatchFailure(op, "unsupported element type for softmax");
     }
-    emitLoopNest(rewriter, loc, reducedShape,
+    emitLoopNestMemref(rewriter, loc, maxBuf.getResult(),
                  [&](llvm::ArrayRef<mlir::Value> outIvs) {
       rewriter.create<mlir::memref::StoreOp>(loc, negInfInit, maxBuf, outIvs);
       rewriter.create<mlir::memref::StoreOp>(loc, negInfInit, sumBuf, outIvs);
     });
 
     // Pass 1: 扫描 src 沿 axis 累积 max 到 max_buf
-    emitLoopNest(rewriter, loc, srcShapeVec,
+    emitLoopNestMemref(rewriter, loc, src,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       auto x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
       auto bufIdxs = makeBufIdxs(idxs);
@@ -1821,7 +1867,7 @@ struct SoftmaxTensorOpLowering
     // Pass 2: 扫描 src，计算 exp(x - max) + 累积 sum
     auto zeroVal = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getZeroAttr(elemTy));
-    emitLoopNest(rewriter, loc, srcShapeVec,
+    emitLoopNestMemref(rewriter, loc, src,
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       auto x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
       auto bufIdxs = makeBufIdxs(idxs);
@@ -1845,7 +1891,7 @@ struct SoftmaxTensorOpLowering
     });
 
     // Pass 3: 扫描 out（存的是 exp），除以 sum
-    emitLoopNest(rewriter, loc, srcShapeVec,
+    emitLoopNestMemref(rewriter, loc, out.getResult(),
                  [&](llvm::ArrayRef<mlir::Value> idxs) {
       auto ex = rewriter.create<mlir::memref::LoadOp>(loc, out, idxs);
       auto bufIdxs = makeBufIdxs(idxs);

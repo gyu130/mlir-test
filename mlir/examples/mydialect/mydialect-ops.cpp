@@ -509,15 +509,20 @@ LogicalResult ConcatTensorOp::inferReturnTypes(
   SmallVector<int64_t> outDims;
   for (int64_t d = 0; d < rank; ++d) {
     if (d == axis) {
+      bool axisDynamic = false;
       int64_t sum = 0;
       for (auto v : operands) {
         auto t = llvm::dyn_cast<mydialect::MyTensorType>(v.getType());
         if (!t) return failure();
         if (t.getShape().size() != rank) return failure();
         if (t.getElementType() != elemTy) return failure();
-        sum += shapeAt(t, d);
+        int64_t dv = shapeAt(t, d);
+        if (mlir::ShapedType::isDynamic(dv))
+          axisDynamic = true;
+        else
+          sum += dv;
       }
-      outDims.push_back(sum);
+      outDims.push_back(axisDynamic ? mlir::ShapedType::kDynamic : sum);
     } else {
       outDims.push_back(shapeAt(firstTy, d));
       for (auto v : operands.drop_front()) {
@@ -562,12 +567,17 @@ LogicalResult ConcatTensorOp::verify() {
   SmallVector<int64_t> expectedDims(rank);
   for (int64_t d = 0; d < rank; ++d) {
     if (d == realAxis) {
+      bool axisDynamic = false;
       int64_t sum = 0;
       for (auto v : getInputs()) {
         auto t = llvm::cast<mydialect::MyTensorType>(v.getType());
-        sum += shapeAt(t, d);
+        int64_t dv = shapeAt(t, d);
+        if (mlir::ShapedType::isDynamic(dv))
+          axisDynamic = true;
+        else
+          sum += dv;
       }
-      expectedDims[d] = sum;
+      expectedDims[d] = axisDynamic ? mlir::ShapedType::kDynamic : sum;
     } else {
       expectedDims[d] = shapeAt(firstTy, d);
     }

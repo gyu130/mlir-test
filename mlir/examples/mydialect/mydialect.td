@@ -172,34 +172,42 @@ def YieldOp : Op<MyDialect, "yield",
 }
 
 //===== 内存操作：alloc / load / store =====
+//
+// 三者均支持 N 维 memref：
+//  - alloc 的尺寸操作数个数 = 结果 memref 的动态维度个数（静态维度无需尺寸）
+//  - load/store 的索引个数必须 = memref 的 rank
 
-// mydialect.alloc : 栈上分配一维数组
-// 用法：%buf = mydialect.alloc(%size) : memref<?xi32>
+// mydialect.alloc : 分配 N 维数组
+// 用法：%buf = mydialect.alloc(%n, %m) : memref<?x?xi32>
 def AllocOp : Op<MyDialect, "alloc"> {
-  let arguments = (ins I32:$size);
+  let arguments = (ins Variadic<I32>:$sizes);
   let results = (outs AnyMemRef:$res);
 
-  let assemblyFormat = "$size attr-dict `:` type($res)";
+  // I32 是 BuildableType，variadic 操作数的类型可省略不写
+  let assemblyFormat = "$sizes attr-dict `:` type($res)";
   let hasVerifier = 1;
 }
 
-// mydialect.load : 数组读取
-// %val = mydialect.load(%buf, %idx) : i32
+// mydialect.load : N 维数组读取，索引数 == rank
+// %val = mydialect.load(%buf, %i, %j) : memref<?x?xi32>, i32
 def LoadOp : Op<MyDialect, "load"> {
-  let arguments = (ins AnyMemRef:$memref, I32:$index);
+  let arguments = (ins AnyMemRef:$memref, Variadic<I32>:$indices);
   let results = (outs I32:$res);
 
-  let assemblyFormat = "$memref `,` $index attr-dict `:` type($memref) `,` type($res)";
+  // rank==0 时省略索引列表
+  let assemblyFormat =
+      "$memref (`,` $indices^)? attr-dict `:` type($memref) `,` type($res)";
   let hasVerifier = 1;
 }
 
-// mydialect.store : 数组写入
-// mydialect.store %val, %buf, %idx : i32
+// mydialect.store : N 维数组写入，索引数 == rank
+// mydialect.store %val, %buf, %i, %j : i32, memref<?x?xi32>
 def StoreOp : Op<MyDialect, "store"> {
-  let arguments = (ins I32:$value, AnyMemRef:$memref, I32:$index);
+  let arguments = (ins I32:$value, AnyMemRef:$memref, Variadic<I32>:$indices);
   let results = (outs);
 
-  let assemblyFormat = "$value `,` $memref `,` $index attr-dict `:` type($value) `,` type($memref)";
+  let assemblyFormat =
+      "$value `,` $memref (`,` $indices^)? attr-dict `:` type($value) `,` type($memref)";
   let hasVerifier = 1;
 }
 
