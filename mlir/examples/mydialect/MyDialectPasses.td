@@ -12,14 +12,21 @@ def LowerMyDialectPrint : Pass<"lower-mydialect-print", "mlir::ModuleOp"> {
   ];
 }
 
-// ============ LowerHwMulPass：mydialect.hw_mul → arith.muli (SW) 或 llvm.call_intrinsic (HW) ============
+// ============ LowerHwMulPass：mydialect hw_* 算子族 → SW / HW 双路径 ============
 def LowerHwMulPass : Pass<"lower-hw-mul", "mlir::ModuleOp"> {
-  let summary = "Lower mydialect.hw_mul to arith.muli or LLVM intrinsic";
+  let summary = "Lower mydialect hw_* ops to arith/memref (SW) or LLVM/external calls (HW)";
   let description = [{
-    Lower mydialect.hw_mul hardware accelerator op into one of two paths:
-      1. Software path (default): hw_mul → arith.muli for CPU JIT execution
-      2. Hardware path (use-hardware-path=true): hw_mul → llvm.call_intrinsic
-         for RISC-V custom instruction / ISS simulation
+    Lower the mydialect hardware operator family into one of two paths.
+    标量族（hw_mul/hw_add/hw_div/hw_and/hw_or/hw_xor）:
+      1. Software path (default): → arith.muli/addi/divsi/andi/ori/xori
+      2. Hardware path (use-hardware-path=true): → llvm.call_intrinsic
+         "llvm.mydialect.hw.<op>.i32"（RISC-V 自定义指令 / ISS 仿真）
+    hw_matmul:
+      1. Software path: scf.for 三层循环 + muli/addi 软件模拟
+      2. Hardware path: func.call 外部符号 mydialect.hw.matmul
+    hw_load/hw_store（DMA）:
+      1. Software path: memref.load / memref.store
+      2. Hardware path: func.call mydialect.hw.dma.load / mydialect.hw.dma.store
   }];
   let options = [
     Option<"useHardwarePath", "use-hardware-path", "bool",

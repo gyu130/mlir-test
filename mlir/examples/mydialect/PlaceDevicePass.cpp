@@ -41,11 +41,18 @@ static bool isPureMyDialectOp(Operation *op) {
          !op->hasTrait<OpTrait::IsTerminator>();
 }
 
-// 以 hw_mul 为种子，沿纯算子 def-use 边做双向闭包（仅同一基本块内）
+// 硬件算子族：全部作为 device placement 的种子
+// （hw_mul/hw_add/hw_div/hw_and/hw_or/hw_xor/hw_matmul/hw_load/hw_store）
+static bool isHwOp(Operation *op) {
+  return isa<HwMulOp, HwAddOp, HwDivOp, HwAndOp, HwOrOp, HwXorOp, HwMatmulOp,
+             HwLoadOp, HwStoreOp>(op);
+}
+
+// 以 hw 算子族为种子，沿纯算子 def-use 边做双向闭包（仅同一基本块内）
 static void collectDeviceOps(Block &block, llvm::DenseSet<Operation *> &dev) {
   llvm::SmallVector<Operation *, 16> worklist;
   for (Operation &op : block)
-    if (isa<HwMulOp>(op))
+    if (isHwOp(&op))
       worklist.push_back(&op);
 
   while (!worklist.empty()) {

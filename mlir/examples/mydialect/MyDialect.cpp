@@ -338,6 +338,73 @@ mlir::LogicalResult StoreOp::verify() {
   return mlir::success();
 }
 
+// ---- HwMatmulOp verify ----
+// A: M×K, B: K×N, C: M×N；均为 2-D i32 memref，静态维度之间必须匹配
+mlir::LogicalResult HwMatmulOp::verify() {
+  auto aTy = llvm::dyn_cast<mlir::MemRefType>(getA().getType());
+  auto bTy = llvm::dyn_cast<mlir::MemRefType>(getB().getType());
+  auto cTy = llvm::dyn_cast<mlir::MemRefType>(getC().getType());
+  if (!aTy || !bTy || !cTy)
+    return emitOpError() << "hw_matmul operands must be ranked memrefs";
+  if (aTy.getRank() != 2 || bTy.getRank() != 2 || cTy.getRank() != 2)
+    return emitOpError() << "hw_matmul requires 2-D memref operands";
+  auto i32Ty = mlir::IntegerType::get(getContext(), 32);
+  if (aTy.getElementType() != i32Ty || bTy.getElementType() != i32Ty ||
+      cTy.getElementType() != i32Ty)
+    return emitOpError() << "hw_matmul only supports i32 memref";
+
+  auto checkMatch = [&](int64_t lhs, int64_t rhs,
+                        llvm::StringRef what) -> mlir::LogicalResult {
+    if (!mlir::ShapedType::isDynamic(lhs) && !mlir::ShapedType::isDynamic(rhs) &&
+        lhs != rhs)
+      return emitOpError() << what << " dimension mismatch (" << lhs
+                           << " vs " << rhs << ")";
+    return mlir::success();
+  };
+  // K: A.dim1 == B.dim0
+  if (mlir::failed(checkMatch(aTy.getDimSize(1), bTy.getDimSize(0), "K")))
+    return mlir::failure();
+  // M: A.dim0 == C.dim0
+  if (mlir::failed(checkMatch(aTy.getDimSize(0), cTy.getDimSize(0), "M")))
+    return mlir::failure();
+  // N: B.dim1 == C.dim1
+  if (mlir::failed(checkMatch(bTy.getDimSize(1), cTy.getDimSize(1), "N")))
+    return mlir::failure();
+  return mlir::success();
+}
+
+// ---- HwLoadOp verify ----
+// DMA 读原语：i32 memref，索引个数必须等于 rank
+mlir::LogicalResult HwLoadOp::verify() {
+  auto mty = llvm::dyn_cast<mlir::MemRefType>(getMemref().getType());
+  if (!mty)
+    return emitOpError() << "hw_load memref must be a ranked memref";
+  if (mty.getElementType() != mlir::IntegerType::get(getContext(), 32))
+    return emitOpError() << "hw_load only supports i32 memref";
+  if (getIndices().size() != static_cast<size_t>(mty.getRank()))
+    return emitOpError() << "hw_load expects " << mty.getRank()
+                         << " index(es) for " << mty.getRank()
+                         << "-D memref, but got " << getIndices().size();
+  return mlir::success();
+}
+
+// ---- HwStoreOp verify ----
+// DMA 写原语：i32 memref，索引个数必须等于 rank
+mlir::LogicalResult HwStoreOp::verify() {
+  auto mty = llvm::dyn_cast<mlir::MemRefType>(getMemref().getType());
+  if (!mty)
+    return emitOpError() << "hw_store memref must be a ranked memref";
+  if (mty.getElementType() != mlir::IntegerType::get(getContext(), 32))
+    return emitOpError() << "hw_store only supports i32 memref";
+  if (getIndices().size() != static_cast<size_t>(mty.getRank()))
+    return emitOpError() << "hw_store expects " << mty.getRank()
+                         << " index(es) for " << mty.getRank()
+                         << "-D memref, but got " << getIndices().size();
+  if (getValue().getType() != mlir::IntegerType::get(getContext(), 32))
+    return emitOpError() << "hw_store value must be i32";
+  return mlir::success();
+}
+
 // ====== 张量 op verify() 已移至 mydialect-ops.cpp 统一实现 ======
 // 此处不再重复定义，避免链接期 duplicate symbol 错误
 
