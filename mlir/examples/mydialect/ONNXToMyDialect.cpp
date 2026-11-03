@@ -382,6 +382,122 @@ private:
   mlir::TypeConverter &converter;
 };
 
+// ONNX.ReduceMax -> mydialect.reduce_max_tensor
+// （ONNX 12+ 有 ReduceMax，但 stub 里没定义——用 ReduceSum + max 模拟；
+//  这里新增一个简化 stub 处理常见场景）
+struct ConvertONNXReduceMax : public mlir::OpRewritePattern<mlir::onnx::ONNXReduceMaxOp> {
+  ConvertONNXReduceMax(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXReduceMaxOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
+    ArrayAttr axesAttr = op.getAxesAttr();
+    if (!axesAttr || axesAttr.empty()) {
+      int64_t rank = 0;
+      auto dataTy = op.getData().getType();
+      if (auto tt = mlir::dyn_cast<mlir::RankedTensorType>(dataTy))
+        rank = tt.getRank();
+      else if (auto mtt = mlir::dyn_cast<mydialect::MyTensorType>(dataTy))
+        rank = mtt.getShape().size();
+      else
+        return failure();
+      llvm::SmallVector<mlir::Attribute> allAxes;
+      for (int64_t i = 0; i < rank; ++i)
+        allAxes.push_back(rewriter.getI64IntegerAttr(i));
+      axesAttr = rewriter.getArrayAttr(allAxes);
+    }
+    BoolAttr keepDimsAttr = op.getKeepdimsAttr();
+    if (!keepDimsAttr) keepDimsAttr = rewriter.getBoolAttr(false);
+    auto data = castIfNeeded(converter, rewriter, op.getLoc(), op.getData());
+    rewriter.replaceOpWithNewOp<mydialect::ReduceMaxTensorOp>(
+        op, outTy, data, axesAttr, keepDimsAttr);
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
+// ONNX.Softmax → mydialect.softmax_tensor
+// axis 规则：ONNX Softmax 缺省 axis=-1（最后一维）。
+struct ConvertONNXSoftmax : public mlir::OpRewritePattern<mlir::onnx::ONNXSoftmaxOp> {
+  ConvertONNXSoftmax(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXSoftmaxOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
+    int64_t axis = -1;
+    if (auto axisAttr = op.getAxisAttr()) axis = axisAttr.getInt();
+    auto x = castIfNeeded(converter, rewriter, op.getLoc(), op.getInput());
+    rewriter.replaceOpWithNewOp<mydialect::SoftmaxTensorOp>(
+        op, outTy, x, rewriter.getI64IntegerAttr(axis));
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
+// ONNX.Concat → mydialect.concat_tensor
+struct ConvertONNXConcat : public mlir::OpRewritePattern<mlir::onnx::ONNXConcatOp> {
+  ConvertONNXConcat(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXConcatOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto outTy = tensorTypeOrSelf(converter, op.getOutput().getType());
+    if (!outTy) return failure();
+    SmallVector<mlir::Value> inputs;
+    for (auto v : op.getInputs()) {
+      inputs.push_back(castIfNeeded(converter, rewriter, op.getLoc(), v));
+    }
+    rewriter.replaceOpWithNewOp<mydialect::ConcatTensorOp>(
+        op, outTy, inputs, op.getAxisAttr());
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
+// ONNX.Conv → mydialect.conv2d_tensor
+// 简化：只支持 NCHW layout + 无 bias + group=1 + 静态 shape。
+// 属性 pads：ONNX 10+ 按 [top, left, bottom, right] 4 维，
+// 简化实现支持 [top,left] 或 [top,left,bottom,right]。
+struct ConvertONNXConv : public mlir::OpRewritePattern<mlir::onnx::ONNXConvOp> {
+  ConvertONNXConv(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
+      : OpRewritePattern(ctx), converter(c) {}
+  mlir::LogicalResult matchAndRewrite(mlir::onnx::ONNXConvOp op,
+      mlir::PatternRewriter &rewriter) const override {
+    auto xTy = converter.convertType(op.getX().getType());
+    auto wTy = converter.convertType(op.getW().getType());
+    auto yTy = converter.convertType(op.getY().getType());
+    if (!xTy || !wTy || !yTy) return failure();
+    auto xMTy = mlir::dyn_cast<mydialect::MyTensorType>(xTy);
+    auto wMTy = mlir::dyn_cast<mydialect::MyTensorType>(wTy);
+    auto yMTy = mlir::dyn_cast<mydialect::MyTensorType>(yTy);
+    if (!xMTy || !wMTy || !yMTy) return failure();
+    if (xMTy.getShape().size() != 4 || wMTy.getShape().size() != 4)
+      return rewriter.notifyMatchFailure(op, "conv2d requires rank-4 input/weight");
+
+    ArrayAttr padsAttr = op.getPadsAttr();
+    // 如果是 2 维（top,left），补成 4 维
+    if (padsAttr && padsAttr.size() == 2) {
+      SmallVector<mlir::Attribute> fullPads = {
+        padsAttr[0], padsAttr[1],
+        mlir::IntegerAttr::get(mlir::IndexType::get(rewriter.getContext()), 0),
+        mlir::IntegerAttr::get(mlir::IndexType::get(rewriter.getContext()), 0)};
+      padsAttr = rewriter.getArrayAttr(fullPads);
+    }
+
+    auto x = castIfNeeded(converter, rewriter, op.getLoc(), op.getX());
+    auto w = castIfNeeded(converter, rewriter, op.getLoc(), op.getW());
+    rewriter.replaceOpWithNewOp<mydialect::Conv2dTensorOp>(
+        op, yMTy, x, w, padsAttr, op.getStridesAttr(), op.getDilationsAttr());
+    return success();
+  }
+private:
+  mlir::TypeConverter &converter;
+};
+
 // arith.constant（结果类型为 ranked tensor）-> mydialect.constant_tensor
 struct ConvertArithConstant : public mlir::OpRewritePattern<arith::ConstantOp> {
   ConvertArithConstant(mlir::MLIRContext *ctx, mlir::TypeConverter &c)
@@ -561,6 +677,10 @@ void populateOnnxToMyDialectConversionPatterns(RewritePatternSet &patterns,
   patterns.add<ConvertONNXReshape>(ctx, typeConverter);
   patterns.add<ConvertONNXTranspose>(ctx, typeConverter);
   patterns.add<ConvertONNXReduceSum>(ctx, typeConverter);
+  patterns.add<ConvertONNXReduceMax>(ctx, typeConverter);
+  patterns.add<ConvertONNXSoftmax>(ctx, typeConverter);
+  patterns.add<ConvertONNXConcat>(ctx, typeConverter);
+  patterns.add<ConvertONNXConv>(ctx, typeConverter);
   patterns.add<ConvertArithConstant>(ctx, typeConverter);
   patterns.add<ConvertONNXEntryPoint>(ctx);
   patterns.add<ConvertONNXLoopYield>(ctx, typeConverter);

@@ -6,6 +6,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -1418,6 +1419,450 @@ struct ScalarToTensorOpLowering
   }
 };
 
+// ========== ReduceMaxTensorOp: reduce_max_tensor → 循环 + cmp max ==========
+// 与 ReduceSum 同构，但归约时用 max 而非 sum：
+//   初始化 -inf（浮点）或 min（整数），然后 cmp max 累积。
+struct ReduceMaxTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::ReduceMaxTensorOp> {
+  using mlir::OpConversionPattern<
+      mydialect::ReduceMaxTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::ReduceMaxTensorOp op,
+      mydialect::ReduceMaxTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value src = ensureMemref(adaptor.getData(), tc, rewriter, loc);
+    auto srcTy = mlir::cast<mlir::MemRefType>(src.getType());
+    mlir::Type elemTy = resTy.getElementType();
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+
+    bool keepDims = op.getKeepDims();
+    llvm::SmallDenseSet<int64_t> axes;
+    for (mlir::Attribute a : op.getAxes())
+      axes.insert(mlir::cast<mlir::IntegerAttr>(a).getInt());
+
+    // 1) 初始化：-inf（浮点）或 int min（整数）
+    mlir::Value initVal;
+    if (auto ft = mlir::dyn_cast<mlir::FloatType>(elemTy)) {
+      llvm::APFloat negInf = llvm::APFloat::getInf(ft.getFloatSemantics(), /*Negative=*/true);
+      initVal = mlir::arith::ConstantOp::create(
+          rewriter, loc, mlir::FloatAttr::get(ft, negInf));
+    } else if (auto it = mlir::dyn_cast<mlir::IntegerType>(elemTy)) {
+      initVal = mlir::arith::ConstantOp::create(
+          rewriter, loc,
+          mlir::IntegerAttr::get(it, llvm::APInt::getSignedMinValue(it.getWidth())));
+    } else {
+      return rewriter.notifyMatchFailure(op, "unsupported element type for reduce_max");
+    }
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> outIvs) {
+      rewriter.create<mlir::memref::StoreOp>(loc, initVal, res, outIvs);
+    });
+
+    // 2) 遍历输入，逐元素 cmp max
+    auto c0 = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+    int64_t srcRank = srcTy.getRank();
+    llvm::SmallVector<int64_t> srcShape(srcTy.getShape().begin(),
+                                         srcTy.getShape().end());
+    emitLoopNest(rewriter, loc, srcShape,
+                 [&](llvm::ArrayRef<mlir::Value> inIvs) {
+      llvm::SmallVector<mlir::Value> outIvs;
+      for (int64_t d = 0; d < srcRank; ++d) {
+        if (axes.contains(d)) {
+          if (keepDims) outIvs.push_back(c0.getResult());
+        } else {
+          outIvs.push_back(inIvs[d]);
+        }
+      }
+      mlir::Value v = rewriter.create<mlir::memref::LoadOp>(loc, src, inIvs);
+      mlir::Value acc = rewriter.create<mlir::memref::LoadOp>(loc, res, outIvs);
+      mlir::Value newVal;
+      if (mlir::isa<mlir::FloatType>(elemTy)) {
+        auto pred = rewriter.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::OGT, v, acc);
+        newVal = rewriter.create<mlir::arith::SelectOp>(loc, pred, v, acc);
+      } else {
+        auto pred = rewriter.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::sgt, v, acc);
+        newVal = rewriter.create<mlir::arith::SelectOp>(loc, pred, v, acc);
+      }
+      rewriter.create<mlir::memref::StoreOp>(loc, newVal, res, outIvs);
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
+// ========== ExpTensorOp: exp_tensor → 循环 + math.exp ==========
+struct ExpTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::ExpTensorOp> {
+  using mlir::OpConversionPattern<mydialect::ExpTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::ExpTensorOp op,
+      mydialect::ExpTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value src = ensureMemref(adaptor.getX(), tc, rewriter, loc);
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    emitLoopNest(rewriter, loc, resTy.getShape(),
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      mlir::Value x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
+      mlir::Value ex = rewriter.create<mlir::math::ExpOp>(loc, x);
+      rewriter.create<mlir::memref::StoreOp>(loc, ex, res, idxs);
+    });
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
+// ========== ConcatTensorOp: concat_tensor → 逐层循环 + memref.store ==========
+// 沿 axis 把所有输入拷贝到输出。实现：对每个输入 in，计算其在输出中的
+// 起始偏移 offset[axis]（累加前面输入的 shape[axis]），然后双层循环
+// （外层遍历 in 的所有非 axis 维，内层遍历 axis 维）做 copy。
+struct ConcatTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::ConcatTensorOp> {
+  using mlir::OpConversionPattern<
+      mydialect::ConcatTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::ConcatTensorOp op,
+      mydialect::ConcatTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    auto res = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+    auto rank = (int64_t)resTy.getRank();
+
+    int64_t rawAxis = (int64_t)op.getAxis();
+    int64_t axis = rawAxis < 0 ? rawAxis + rank : rawAxis;
+
+    // 先把每个输入转成 memref
+    llvm::SmallVector<mlir::Value> srcs;
+    for (auto v : adaptor.getInputs()) {
+      srcs.push_back(ensureMemref(v, tc, rewriter, loc));
+    }
+    if (srcs.empty())
+      return rewriter.notifyMatchFailure(op, "no inputs to concat");
+
+    int64_t offset = 0;
+    auto c0 = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+
+    for (auto &srcVal : srcs) {
+      auto srcTy = mlir::cast<mlir::MemRefType>(srcVal.getType());
+      llvm::SmallVector<int64_t> srcShape(srcTy.getShape().begin(),
+                                         srcTy.getShape().end());
+      int64_t axisSize = srcShape[axis];
+      if (axisSize == 0) continue;
+
+      // emitLoopNest 遍历 src 的所有维度，body 内：
+      //   outIdx[axis] = inIdx[axis] + offset  （index 加法）
+      //   其余 outIdx[d] = inIdx[d]
+      emitLoopNest(rewriter, loc, srcShape,
+                   [&](llvm::ArrayRef<mlir::Value> inIvs) {
+        llvm::SmallVector<mlir::Value> outIvs;
+        for (int64_t d = 0; d < rank; ++d) {
+          if (d == axis) {
+            auto offVal = mlir::arith::ConstantIndexOp::create(
+                rewriter, loc, offset);
+            auto outIdx = mlir::arith::AddIOp::create(
+                rewriter, loc, inIvs[d], offVal);
+            outIvs.push_back(outIdx.getResult());
+          } else {
+            outIvs.push_back(inIvs[d]);
+          }
+        }
+        mlir::Value v = rewriter.create<mlir::memref::LoadOp>(loc, srcVal, inIvs);
+        rewriter.create<mlir::memref::StoreOp>(loc, v, res, outIvs);
+      });
+      offset += axisSize;
+    }
+    rewriter.replaceOp(op, res.getResult());
+    return mlir::success();
+  }
+};
+
+// ========== Conv2dTensorOp: conv2d_tensor → 5 层 scf.for ==========
+// 基础 NCHW 实现：
+//   for n, c_out, oh, ow, c_in, kh, kw:
+//     ih = oh*stride_h + kh*dilation_h - pad_top
+//     iw = ow*stride_w + kw*dilation_w - pad_left
+//     acc += input[n, c_in, ih, iw] * weight[c_out, c_in, kh, kw]
+// 为了简化，我们把 c_in/kh/kw 展开成单一的累加循环（emitLoopNest 3 维），
+// 外层 n/c_out/oh/ow 手工构造，body 内累加并 store 回 res[n, c_out, oh, ow]。
+struct Conv2dTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::Conv2dTensorOp> {
+  using mlir::OpConversionPattern<mydialect::Conv2dTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::Conv2dTensorOp op,
+      mydialect::Conv2dTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getOutput().getType()));
+    auto input = ensureMemref(adaptor.getInput(), tc, rewriter, loc);
+    auto weight = ensureMemref(adaptor.getWeight(), tc, rewriter, loc);
+    auto inputTy = mlir::cast<mlir::MemRefType>(input.getType());
+    auto weightTy = mlir::cast<mlir::MemRefType>(weight.getType());
+    mlir::Type elemTy = resTy.getElementType();
+    auto out = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+
+    int64_t N = inputTy.getShape()[0];
+    int64_t C_in = inputTy.getShape()[1];
+    int64_t H = inputTy.getShape()[2];
+    int64_t W = inputTy.getShape()[3];
+    int64_t C_out = weightTy.getShape()[0];
+    int64_t kH = weightTy.getShape()[2];
+    int64_t kW = weightTy.getShape()[3];
+    int64_t OH = resTy.getShape()[2];
+    int64_t OW = resTy.getShape()[3];
+
+    // 属性处理
+    auto padsAttr = op.getPadsAttr();  // OptionalAttr<ArrayAttr> → generated accessor
+    auto stridesAttr = op.getStrides();
+    auto dilationsAttr = op.getDilations();
+    int64_t padTop = 0, padLeft = 0;
+    int64_t strideH = 1, strideW = 1;
+    int64_t dilH = 1, dilW = 1;
+    if (padsAttr && padsAttr.size() >= 2) {
+      padTop = mlir::cast<mlir::IntegerAttr>(padsAttr[0]).getInt();
+      padLeft = mlir::cast<mlir::IntegerAttr>(padsAttr[1]).getInt();
+    }
+    if (stridesAttr && !stridesAttr.empty()) {
+      strideH = mlir::cast<mlir::IntegerAttr>(stridesAttr[0]).getInt();
+      if (stridesAttr.size() > 1)
+        strideW = mlir::cast<mlir::IntegerAttr>(stridesAttr[1]).getInt();
+    }
+    if (dilationsAttr && !dilationsAttr.empty()) {
+      dilH = mlir::cast<mlir::IntegerAttr>(dilationsAttr[0]).getInt();
+      if (dilationsAttr.size() > 1)
+        dilW = mlir::cast<mlir::IntegerAttr>(dilationsAttr[1]).getInt();
+    }
+
+    auto c0i = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(elemTy));
+    auto c0idx = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+
+    mlir::OpBuilder::InsertionGuard outerGuard(rewriter);
+
+    // 外层 4 层：N, C_out, OH, OW —— 用手工 scf.for + emitLoopNest 不太方便，
+    // 简化：用 4 层手工 scf.for 嵌套（避免 InsertionGuard 问题）。
+    auto mLoop = mlir::scf::ForOp::create(
+        rewriter, loc, c0idx.getResult(),
+        mlir::arith::ConstantIndexOp::create(rewriter, loc, N),
+        c0idx.getResult());
+    rewriter.setInsertionPointToStart(mLoop.getBody());
+
+    auto coLoop = mlir::scf::ForOp::create(
+        rewriter, loc, c0idx.getResult(),
+        mlir::arith::ConstantIndexOp::create(rewriter, loc, C_out),
+        c0idx.getResult());
+    rewriter.setInsertionPointToStart(coLoop.getBody());
+
+    auto ohLoop = mlir::scf::ForOp::create(
+        rewriter, loc, c0idx.getResult(),
+        mlir::arith::ConstantIndexOp::create(rewriter, loc, OH),
+        c0idx.getResult());
+    rewriter.setInsertionPointToStart(ohLoop.getBody());
+
+    auto owLoop = mlir::scf::ForOp::create(
+        rewriter, loc, c0idx.getResult(),
+        mlir::arith::ConstantIndexOp::create(rewriter, loc, OW),
+        c0idx.getResult());
+    rewriter.setInsertionPointToStart(owLoop.getBody());
+
+    // 清零 out[n, co, oh, ow]
+    auto nIv = mLoop.getBody()->getArgument(0);
+    auto coIv = coLoop.getBody()->getArgument(0);
+    auto ohIv = ohLoop.getBody()->getArgument(0);
+    auto owIv = owLoop.getBody()->getArgument(0);
+    rewriter.create<mlir::memref::StoreOp>(
+        loc, c0i.getResult(), out, mlir::ValueRange{nIv, coIv, ohIv, owIv});
+
+    // 累加循环：emitLoopNest({C_in, kH, kW})
+    llvm::SmallVector<int64_t> accShape = {C_in, kH, kW};
+    emitLoopNest(rewriter, loc, accShape,
+                 [&](llvm::ArrayRef<mlir::Value> accIvs) {
+      auto ciIv = accIvs[0];
+      auto khIv = accIvs[1];
+      auto kwIv = accIvs[2];
+
+      // ih = oh * strideH + kh * dilH - padTop
+      auto ih0 = mlir::arith::MulIOp::create(rewriter, loc, ohIv,
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, strideH));
+      auto ih1 = mlir::arith::MulIOp::create(rewriter, loc, khIv,
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, dilH));
+      auto ih2 = mlir::arith::AddIOp::create(rewriter, loc, ih0.getResult(), ih1.getResult());
+      auto ih = mlir::arith::SubIOp::create(rewriter, loc, ih2.getResult(),
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, padTop));
+
+      auto iw0 = mlir::arith::MulIOp::create(rewriter, loc, owIv,
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, strideW));
+      auto iw1 = mlir::arith::MulIOp::create(rewriter, loc, kwIv,
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, dilW));
+      auto iw2 = mlir::arith::AddIOp::create(rewriter, loc, iw0.getResult(), iw1.getResult());
+      auto iw = mlir::arith::SubIOp::create(rewriter, loc, iw2.getResult(),
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, padLeft));
+
+      auto inVal = rewriter.create<mlir::memref::LoadOp>(
+          loc, input, mlir::ValueRange{nIv, ciIv, ih.getResult(), iw.getResult()});
+      auto wVal = rewriter.create<mlir::memref::LoadOp>(
+          loc, weight, mlir::ValueRange{coIv, ciIv, khIv, kwIv});
+      auto prod = mlir::isa<mlir::IntegerType>(elemTy)
+          ? (mlir::Value)mlir::arith::MulIOp::create(rewriter, loc, inVal, wVal)
+          : (mlir::Value)mlir::arith::MulFOp::create(rewriter, loc, inVal, wVal);
+      auto acc = rewriter.create<mlir::memref::LoadOp>(
+          loc, out, mlir::ValueRange{nIv, coIv, ohIv, owIv});
+      auto sum = mlir::isa<mlir::IntegerType>(elemTy)
+          ? (mlir::Value)mlir::arith::AddIOp::create(rewriter, loc, acc, prod)
+          : (mlir::Value)mlir::arith::AddFOp::create(rewriter, loc, acc, prod);
+      rewriter.create<mlir::memref::StoreOp>(
+          loc, sum, out, mlir::ValueRange{nIv, coIv, ohIv, owIv});
+    });
+
+    rewriter.replaceOp(op, out.getResult());
+    return mlir::success();
+  }
+};
+
+// ========== SoftmaxTensorOp: softmax_tensor → 3 次扫描 ==========
+// softmax(x, axis) = exp(x - max_axis(x)) / sum_axis(exp(x - max_axis(x)))
+//
+// 实现策略：
+// 1. 扫描输入，沿 axis 找 max → 存入 max_buf（axis 维 size=1）
+// 2. 扫描输入，计算 exp(x - max_buf)，同时沿 axis 累积 sum → exp_buf + sum_buf
+// 3. 扫描 exp_buf，计算 exp / sum_buf → 存入 output
+//
+// 每次扫描用 emitLoopNest 遍历输入 shape，body 内手工从 full index 构造
+// max_buf/sum_buf 的索引（axis 维固定为 0）。
+struct SoftmaxTensorOpLowering
+    : public mlir::OpConversionPattern<mydialect::SoftmaxTensorOp> {
+  using mlir::OpConversionPattern<mydialect::SoftmaxTensorOp>::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mydialect::SoftmaxTensorOp op,
+      mydialect::SoftmaxTensorOp::Adaptor adaptor,
+      mlir::ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    const auto &tc = *getTypeConverter();
+    auto resTy = mlir::cast<mlir::MemRefType>(
+        tc.convertType(op.getRes().getType()));
+    mlir::Value src = ensureMemref(adaptor.getX(), tc, rewriter, loc);
+    auto srcTy = mlir::cast<mlir::MemRefType>(src.getType());
+    mlir::Type elemTy = resTy.getElementType();
+    auto out = rewriter.create<mlir::memref::AllocOp>(loc, resTy);
+
+    int64_t rank = (int64_t)srcTy.getRank();
+    int64_t rawAxis = (int64_t)op.getAxis();
+    int64_t axis = rawAxis < 0 ? rawAxis + rank : rawAxis;
+
+    // max_buf 和 sum_buf 的 shape：axis 维 = 1，其余同 src
+    llvm::SmallVector<int64_t> reducedShape;
+    for (int64_t d = 0; d < rank; ++d)
+      reducedShape.push_back(d == axis ? 1 : srcTy.getShape()[d]);
+    auto reducedMemrefTy = mlir::MemRefType::get(reducedShape, elemTy);
+    auto maxBuf = rewriter.create<mlir::memref::AllocOp>(loc, reducedMemrefTy);
+    auto sumBuf = rewriter.create<mlir::memref::AllocOp>(loc, reducedMemrefTy);
+
+    // 构造 buf 的索引：axis 维固定 0
+    auto c0idx = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+    auto makeBufIdxs = [&](llvm::ArrayRef<mlir::Value> fullIdxs) {
+      llvm::SmallVector<mlir::Value> out;
+      for (int64_t d = 0; d < rank; ++d)
+        out.push_back(d == axis ? c0idx.getResult() : fullIdxs[d]);
+      return out;
+    };
+
+    auto srcShapeVec = llvm::SmallVector<int64_t>(
+        srcTy.getShape().begin(), srcTy.getShape().end());
+
+    // Pass 1: 沿 axis 扫描找 max → max_buf
+    mlir::Value negInfInit;
+    if (auto ft = mlir::dyn_cast<mlir::FloatType>(elemTy)) {
+      negInfInit = mlir::arith::ConstantOp::create(rewriter, loc,
+          mlir::FloatAttr::get(ft,
+              llvm::APFloat::getInf(ft.getFloatSemantics(), /*Negative=*/true)));
+    } else if (auto it = mlir::dyn_cast<mlir::IntegerType>(elemTy)) {
+      negInfInit = mlir::arith::ConstantOp::create(rewriter, loc,
+          mlir::IntegerAttr::get(it, llvm::APInt::getSignedMinValue(it.getWidth())));
+    } else {
+      return rewriter.notifyMatchFailure(op, "unsupported element type for softmax");
+    }
+    emitLoopNest(rewriter, loc, reducedShape,
+                 [&](llvm::ArrayRef<mlir::Value> outIvs) {
+      rewriter.create<mlir::memref::StoreOp>(loc, negInfInit, maxBuf, outIvs);
+      rewriter.create<mlir::memref::StoreOp>(loc, negInfInit, sumBuf, outIvs);
+    });
+
+    // Pass 1: 扫描 src 沿 axis 累积 max 到 max_buf
+    emitLoopNest(rewriter, loc, srcShapeVec,
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      auto x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
+      auto bufIdxs = makeBufIdxs(idxs);
+      auto acc = rewriter.create<mlir::memref::LoadOp>(loc, maxBuf, bufIdxs);
+      mlir::Value pred, newVal;
+      if (mlir::isa<mlir::FloatType>(elemTy)) {
+        pred = rewriter.create<mlir::arith::CmpFOp>(loc,
+            mlir::arith::CmpFPredicate::OGT, x, acc);
+      } else {
+        pred = rewriter.create<mlir::arith::CmpIOp>(loc,
+            mlir::arith::CmpIPredicate::sgt, x, acc);
+      }
+      newVal = rewriter.create<mlir::arith::SelectOp>(loc, pred, x, acc);
+      rewriter.create<mlir::memref::StoreOp>(loc, newVal, maxBuf, bufIdxs);
+    });
+
+    // Pass 2: 扫描 src，计算 exp(x - max) + 累积 sum
+    auto zeroVal = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(elemTy));
+    emitLoopNest(rewriter, loc, srcShapeVec,
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      auto x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
+      auto bufIdxs = makeBufIdxs(idxs);
+      auto mx = rewriter.create<mlir::memref::LoadOp>(loc, maxBuf, bufIdxs);
+      mlir::Value diff;
+      if (mlir::isa<mlir::FloatType>(elemTy))
+        diff = rewriter.create<mlir::arith::SubFOp>(loc, x, mx);
+      else
+        diff = rewriter.create<mlir::arith::SubIOp>(loc, x, mx);
+      auto ex = rewriter.create<mlir::math::ExpOp>(loc, diff);
+
+      // 存 exp 到 out（临时），同时累加 sum
+      rewriter.create<mlir::memref::StoreOp>(loc, ex, out, idxs);
+      auto acc = rewriter.create<mlir::memref::LoadOp>(loc, sumBuf, bufIdxs);
+      mlir::Value newSum;
+      if (mlir::isa<mlir::FloatType>(elemTy))
+        newSum = rewriter.create<mlir::arith::AddFOp>(loc, acc, ex);
+      else
+        newSum = rewriter.create<mlir::arith::AddIOp>(loc, acc, ex);
+      rewriter.create<mlir::memref::StoreOp>(loc, newSum, sumBuf, bufIdxs);
+    });
+
+    // Pass 3: 扫描 out（存的是 exp），除以 sum
+    emitLoopNest(rewriter, loc, srcShapeVec,
+                 [&](llvm::ArrayRef<mlir::Value> idxs) {
+      auto ex = rewriter.create<mlir::memref::LoadOp>(loc, out, idxs);
+      auto bufIdxs = makeBufIdxs(idxs);
+      auto sum = rewriter.create<mlir::memref::LoadOp>(loc, sumBuf, bufIdxs);
+      mlir::Value result;
+      if (mlir::isa<mlir::FloatType>(elemTy))
+        result = rewriter.create<mlir::arith::DivFOp>(loc, ex, sum);
+      else
+        result = rewriter.create<mlir::arith::DivSIOp>(loc, ex, sum);
+      rewriter.create<mlir::memref::StoreOp>(loc, result, out, idxs);
+    });
+
+    rewriter.replaceOp(op, out.getResult());
+    return mlir::success();
+  }
+};
+
 } // anonymous namespace
 
 namespace mydialect {
@@ -1449,6 +1894,11 @@ void populateMyDialectToLowerPatterns(mlir::RewritePatternSet &patterns,
 	ReduceSumTensorOpLowering,
 	ReluTensorOpLowering,
 	MatMulTensorOpLowering,
+	ReduceMaxTensorOpLowering,
+	ExpTensorOpLowering,
+	ConcatTensorOpLowering,
+	Conv2dTensorOpLowering,
+	SoftmaxTensorOpLowering,
 	LoopOpLowering,
 	TensorToScalarOpLowering,
 	ScalarToTensorOpLowering>(converter, patterns.getContext());

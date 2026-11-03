@@ -114,6 +114,14 @@ def ONNXReduceSumOp : Op<OnnxDialect, "ReduceSum", [Pure]> {
   let assemblyFormat = "$data (`,` $axes^)? (`,` $keepdims^)? attr-dict `:` type($data) `->` type($output)";
 }
 
+// ONNX ReduceMax: 同 ReduceSum，归约取 max
+def ONNXReduceMaxOp : Op<OnnxDialect, "ReduceMax", [Pure]> {
+  let arguments = (ins AnyTensor:$data, OptionalAttr<ArrayAttr>:$axes,
+                   DefaultValuedAttr<BoolAttr, "false">:$keepdims);
+  let results = (outs AnyTensor:$output);
+  let assemblyFormat = "$data (`,` $axes^)? (`,` $keepdims^)? attr-dict `:` type($data) `->` type($output)";
+}
+
 //============================= ONNX Loop =============================
 // 对标 ONNX Loop：最大迭代次数 + 条件 + 循环携带张量，body 产出 (cond, carry)。
 // 终止符 mnemonic 用 "Yield"（即 onnx.Yield），与真实 onnx-mlir 命名一致。
@@ -170,6 +178,38 @@ def ONNXMatMulOp : Op<OnnxDialect, "MatMul", [Pure]> {
   let arguments = (ins AnyTensor:$A, AnyTensor:$B);
   let results = (outs AnyTensor:$Y);
   let assemblyFormat = "$A `,` $B attr-dict `:` type($A) `,` type($B) `->` type($Y)";
+}
+
+// ONNX Softmax: softmax(x, axis) = exp(x - max) / sum(exp(x - max))
+// 简化 stub：axis 用 OptionalAttr；默认按最后一维归约。
+// ONNX 语义：axis=-1 表示最后一维，axis=0 表示第一维。
+def ONNXSoftmaxOp : Op<OnnxDialect, "Softmax", [Pure]> {
+  let arguments = (ins AnyTensor:$input, OptionalAttr<I64Attr>:$axis);
+  let results = (outs AnyTensor:$output);
+  let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($output)";
+}
+
+// ONNX Concat: 沿 axis 拼接多个输入
+def ONNXConcatOp : Op<OnnxDialect, "Concat", [Pure]> {
+  let arguments = (ins Variadic<AnyTensor>:$inputs, I64Attr:$axis);
+  let results = (outs AnyTensor:$output);
+  let assemblyFormat = "$inputs `,` $axis attr-dict `:` type($inputs) `->` type($output)";
+}
+
+// ONNX Conv: 基础 2D 卷积（无 bias + 无 dilation + 无 group）
+// 简化 stub：只支持 NCHW layout + 静态 pads/strides/dilations 属性。
+// bias 操作数暂不支持（Conv2dTensorOp 无 bias）。
+def ONNXConvOp : Op<OnnxDialect, "Conv", [Pure]> {
+  let arguments = (ins
+    AnyTensor:$X,
+    AnyTensor:$W,
+    OptionalAttr<ArrayAttr>:$pads,
+    DefaultValuedAttr<ArrayAttr, "{}">:$strides,
+    DefaultValuedAttr<ArrayAttr, "{}">:$dilations,
+    DefaultValuedAttr<I64Attr, "1">:$group
+  );
+  let results = (outs AnyTensor:$Y);
+  let assemblyFormat = "$X `,` $W attr-dict `:` type($X) `,` type($W) `->` type($Y)";
 }
 
 #endif // ONNX_OPS_TD

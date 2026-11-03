@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -84,7 +85,8 @@ struct LowerMyDialectPrintPass
                     mlir::LLVM::LLVMDialect,
                     mlir::arith::ArithDialect,
                     mlir::scf::SCFDialect,
-                    mlir::memref::MemRefDialect>();
+                    mlir::memref::MemRefDialect,
+                    mlir::math::MathDialect>();
   }
 
   void runOnOperation() override {
@@ -149,6 +151,11 @@ struct LowerMyDialectPrintPass
     target.addIllegalOp<mydialect::ReduceSumTensorOp>();
     target.addIllegalOp<mydialect::ReluTensorOp>();
     target.addIllegalOp<mydialect::MatMulTensorOp>();
+    target.addIllegalOp<mydialect::ReduceMaxTensorOp>();
+    target.addIllegalOp<mydialect::ExpTensorOp>();
+    target.addIllegalOp<mydialect::ConcatTensorOp>();
+    target.addIllegalOp<mydialect::Conv2dTensorOp>();
+    target.addIllegalOp<mydialect::SoftmaxTensorOp>();
     // SimpleCParser 桥接 op：由 pass.cpp 里的 TensorToScalarOpLowering /
     // ScalarToTensorOpLowering 转成 memref.load / memref.alloc+store
     target.addIllegalOp<mydialect::TensorToScalarOp>();
@@ -158,6 +165,7 @@ struct LowerMyDialectPrintPass
     target.addLegalDialect<mlir::arith::ArithDialect>();
     target.addLegalDialect<mlir::scf::SCFDialect>();
     target.addLegalDialect<mlir::memref::MemRefDialect>();
+    target.addLegalDialect<mlir::math::MathDialect>();
     // pattern 内手工插入的 unrealized_conversion_cast（wrapped_i32→i32 擦除）
     // 会作为普通新 op 做合法性检查，必须显式标记合法；
     // 转换结束时驱动会自动折叠掉已解耦的 cast。

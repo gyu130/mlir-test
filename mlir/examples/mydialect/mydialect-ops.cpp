@@ -387,6 +387,7 @@ LogicalResult LoopOp::verify() {
 }
 
 // ---------------- MatMulTensorOp ----------------
+// 文件级 shapeAt 供多个 op 共用
 static int64_t shapeAt(mydialect::MyTensorType t, size_t i) {
   return mlir::cast<mlir::IntegerAttr>(t.getShape()[i]).getInt();
 }
@@ -427,6 +428,232 @@ LogicalResult MatMulTensorOp::verify() {
     return emitOpError("matmul result shape must be [M, N]");
   if (aTy.getElementType() != bTy.getElementType() ||
       aTy.getElementType() != yTy.getElementType())
+    return emitOpError("element types must match");
+  return success();
+}
+
+// ---------------- ReduceMaxTensorOp ----------------
+LogicalResult ReduceMaxTensorOp::inferReturnTypes(
+    MLIRContext *ctx, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type>& inferredReturnTypes) {
+  if (operands.empty()) return failure();
+  auto dataTy = llvm::cast<mydialect::MyTensorType>(operands[0].getType());
+  auto &props = *properties.as<const Properties *>();
+  bool keepDims = props.keep_dims ? props.keep_dims.getValue() : false;
+  auto axesAttr = props.axes;
+  auto inShape = dataTy.getShape();
+  SmallVector<Attribute> outShapeAttrs;
+  for (auto idx : llvm::seq<int64_t>(0, inShape.size())) {
+    bool isReduce = llvm::any_of(axesAttr, [&](Attribute a) {
+      return llvm::cast<mlir::IntegerAttr>(a).getInt() == idx;
+    });
+    if (!isReduce) {
+      outShapeAttrs.push_back(inShape[idx]);
+    } else if (keepDims) {
+      outShapeAttrs.push_back(IntegerAttr::get(IndexType::get(ctx), 1));
+    }
+  }
+  auto outTy = mydialect::MyTensorType::get(
+      ctx, ArrayAttr::get(ctx, outShapeAttrs), dataTy.getElementType());
+  inferredReturnTypes.push_back(outTy);
+  return success();
+}
+
+LogicalResult ReduceMaxTensorOp::verify() {
+  auto dataTy = llvm::dyn_cast<mydialect::MyTensorType>(getData().getType());
+  auto resTy = llvm::dyn_cast<mydialect::MyTensorType>(getRes().getType());
+  if (!dataTy || !resTy) return emitOpError("operands must be MyTensorType");
+  int64_t rank = dataTy.getShape().size();
+  llvm::SmallDenseSet<int64_t, 8> seen;
+  for (auto item : getAxes()) {
+    int64_t axis = llvm::cast<mlir::IntegerAttr>(item).getInt();
+    if (axis < 0 || axis >= rank)
+      return emitOpError("reduce axis out of range");
+    if (!seen.insert(axis).second)
+      return emitOpError("duplicate axes");
+  }
+  bool keepDims = getKeepDims();
+  auto inShape = dataTy.getShape();
+  SmallVector<Attribute> expectedShapeVec;
+  for (int64_t idx = 0; idx < rank; ++idx) {
+    bool isReduce = seen.contains(idx);
+    if (!isReduce)
+      expectedShapeVec.push_back(inShape[idx]);
+    else if (keepDims)
+      expectedShapeVec.push_back(IntegerAttr::get(IndexType::get(dataTy.getContext()), 1));
+  }
+  auto expected = ArrayAttr::get(dataTy.getContext(), expectedShapeVec);
+  if (resTy.getShape() != expected)
+    return emitOpError("result shape mismatch");
+  if (dataTy.getElementType() != resTy.getElementType())
+    return emitOpError("element type mismatch");
+  return success();
+}
+
+// ---------------- ConcatTensorOp ----------------
+LogicalResult ConcatTensorOp::inferReturnTypes(
+    MLIRContext *ctx, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type>& inferredReturnTypes) {
+  if (operands.empty()) return failure();
+  auto &props = *properties.as<const Properties *>();
+  int64_t rawAxis = props.axis.getInt();
+  auto firstTy = llvm::dyn_cast<mydialect::MyTensorType>(operands[0].getType());
+  if (!firstTy) return failure();
+  int64_t axis = rawAxis;
+  int64_t rank = firstTy.getShape().size();
+  if (axis < 0) axis += rank;
+  if (axis < 0 || axis >= rank) return failure();
+  Type elemTy = firstTy.getElementType();
+  SmallVector<int64_t> outDims;
+  for (int64_t d = 0; d < rank; ++d) {
+    if (d == axis) {
+      int64_t sum = 0;
+      for (auto v : operands) {
+        auto t = llvm::dyn_cast<mydialect::MyTensorType>(v.getType());
+        if (!t) return failure();
+        if (t.getShape().size() != rank) return failure();
+        if (t.getElementType() != elemTy) return failure();
+        sum += shapeAt(t, d);
+      }
+      outDims.push_back(sum);
+    } else {
+      outDims.push_back(shapeAt(firstTy, d));
+      for (auto v : operands.drop_front()) {
+        auto t = llvm::dyn_cast<mydialect::MyTensorType>(v.getType());
+        if (!t) return failure();
+        if (shapeAt(t, d) != outDims[d]) return failure();
+      }
+    }
+  }
+  SmallVector<Attribute> outShapeVec;
+  for (int64_t d : outDims)
+    outShapeVec.push_back(IntegerAttr::get(IndexType::get(ctx), d));
+  inferredReturnTypes.push_back(mydialect::MyTensorType::get(
+      ctx, ArrayAttr::get(ctx, outShapeVec), elemTy));
+  return success();
+}
+
+LogicalResult ConcatTensorOp::verify() {
+  if (getInputs().empty()) return emitOpError("no inputs to concat");
+  int64_t rawAxis = (int64_t)getAxis();
+  auto firstTy = llvm::dyn_cast<mydialect::MyTensorType>(getInputs()[0].getType());
+  auto resTy = llvm::dyn_cast<mydialect::MyTensorType>(getRes().getType());
+  if (!firstTy || !resTy) return emitOpError("operands/result must be MyTensorType");
+  int64_t rank = firstTy.getShape().size();
+  int64_t realAxis = rawAxis;
+  if (realAxis < 0) realAxis += rank;
+  if (realAxis < 0 || realAxis >= rank)
+    return emitOpError("axis out of range");
+  for (auto v : getInputs()) {
+    auto t = llvm::dyn_cast<mydialect::MyTensorType>(v.getType());
+    if (!t) return emitOpError("all inputs must be MyTensorType");
+    if (t.getShape().size() != rank)
+      return emitOpError("inputs must have same rank");
+    if (t.getElementType() != firstTy.getElementType())
+      return emitOpError("all inputs must have same element type");
+    for (int64_t d = 0; d < rank; ++d) {
+      if (d != realAxis && shapeAt(t, d) != shapeAt(firstTy, d))
+        return emitOpError("inputs must match on non-axis dimensions");
+    }
+  }
+  // 结果 shape 校验
+  SmallVector<int64_t> expectedDims(rank);
+  for (int64_t d = 0; d < rank; ++d) {
+    if (d == realAxis) {
+      int64_t sum = 0;
+      for (auto v : getInputs()) {
+        auto t = llvm::cast<mydialect::MyTensorType>(v.getType());
+        sum += shapeAt(t, d);
+      }
+      expectedDims[d] = sum;
+    } else {
+      expectedDims[d] = shapeAt(firstTy, d);
+    }
+  }
+  if ((int64_t)resTy.getShape().size() != rank)
+    return emitOpError("result rank mismatch");
+  for (int64_t d = 0; d < rank; ++d) {
+    if (shapeAt(resTy, d) != expectedDims[d])
+      return emitOpError("result shape mismatch");
+  }
+  if (resTy.getElementType() != firstTy.getElementType())
+    return emitOpError("result element type mismatch");
+  return success();
+}
+
+// ---------------- Conv2dTensorOp ----------------
+static ArrayAttr getOrPad(ArrayAttr a, MLIRContext *ctx, int64_t n, int64_t def) {
+  if (a && (int64_t)a.size() == n) return a;
+  SmallVector<Attribute> vec;
+  for (int64_t i = 0; i < n; ++i)
+    vec.push_back(IntegerAttr::get(IndexType::get(ctx), def));
+  return ArrayAttr::get(ctx, vec);
+}
+
+LogicalResult Conv2dTensorOp::inferReturnTypes(
+    MLIRContext *ctx, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type>& inferredReturnTypes) {
+  if (operands.size() < 2) return failure();
+  auto inputTy = llvm::dyn_cast<mydialect::MyTensorType>(operands[0].getType());
+  auto weightTy = llvm::dyn_cast<mydialect::MyTensorType>(operands[1].getType());
+  if (!inputTy || !weightTy) return failure();
+  if (inputTy.getShape().size() != 4 || weightTy.getShape().size() != 4)
+    return failure();
+  // input [N, C_in, H, W], weight [C_out, C_in/G, kH, kW]，这里 G=1 → C_in 必须等于 C_in/G
+  int64_t N = shapeAt(inputTy, 0);
+  int64_t C_in = shapeAt(inputTy, 1);
+  int64_t H = shapeAt(inputTy, 2);
+  int64_t W = shapeAt(inputTy, 3);
+  int64_t C_out = shapeAt(weightTy, 0);
+  int64_t kH = shapeAt(weightTy, 2);
+  int64_t kW = shapeAt(weightTy, 3);
+
+  auto &props = *properties.as<const Properties *>();
+  ArrayAttr padsAttr = props.pads;
+  ArrayAttr stridesAttr = props.strides;
+  ArrayAttr dilationsAttr = props.dilations;
+  if (!stridesAttr || stridesAttr.empty()) stridesAttr = getOrPad(nullptr, ctx, 2, 1);
+  if (!dilationsAttr || dilationsAttr.empty()) dilationsAttr = getOrPad(nullptr, ctx, 2, 1);
+  if (!padsAttr) padsAttr = getOrPad(nullptr, ctx, 4, 0);
+  // pads = [top, left, bottom, right]
+  int64_t padTop    = llvm::cast<IntegerAttr>(padsAttr[0]).getInt();
+  int64_t padLeft   = llvm::cast<IntegerAttr>(padsAttr[1]).getInt();
+  int64_t padBottom = llvm::cast<IntegerAttr>(padsAttr[2]).getInt();
+  int64_t padRight  = llvm::cast<IntegerAttr>(padsAttr[3]).getInt();
+  int64_t strideH = llvm::cast<IntegerAttr>(stridesAttr[0]).getInt();
+  int64_t strideW = llvm::cast<IntegerAttr>(stridesAttr[1]).getInt();
+  int64_t dilH = llvm::cast<IntegerAttr>(dilationsAttr[0]).getInt();
+  int64_t dilW = llvm::cast<IntegerAttr>(dilationsAttr[1]).getInt();
+
+  int64_t OH = (H + padTop + padBottom - dilH * (kH - 1) - 1) / strideH + 1;
+  int64_t OW = (W + padLeft + padRight - dilW * (kW - 1) - 1) / strideW + 1;
+
+  SmallVector<Attribute> outShapeVec = {
+    IntegerAttr::get(IndexType::get(ctx), N),
+    IntegerAttr::get(IndexType::get(ctx), C_out),
+    IntegerAttr::get(IndexType::get(ctx), OH),
+    IntegerAttr::get(IndexType::get(ctx), OW)};
+  inferredReturnTypes.push_back(mydialect::MyTensorType::get(
+      ctx, ArrayAttr::get(ctx, outShapeVec), inputTy.getElementType()));
+  return success();
+}
+
+LogicalResult Conv2dTensorOp::verify() {
+  auto inputTy = llvm::dyn_cast<mydialect::MyTensorType>(getInput().getType());
+  auto weightTy = llvm::dyn_cast<mydialect::MyTensorType>(getWeight().getType());
+  auto outTy = llvm::dyn_cast<mydialect::MyTensorType>(getOutput().getType());
+  if (!inputTy || !weightTy || !outTy)
+    return emitOpError("all operands must be MyTensorType");
+  if (inputTy.getShape().size() != 4 || weightTy.getShape().size() != 4)
+    return emitOpError("conv2d requires rank-4 input/weight");
+  // 验证 C_in 对齐（group=1）
+  if (shapeAt(inputTy, 1) != shapeAt(weightTy, 1))
+    return emitOpError("C_in of input/weight must match");
+  if (inputTy.getElementType() != weightTy.getElementType() ||
+      inputTy.getElementType() != outTy.getElementType())
     return emitOpError("element types must match");
   return success();
 }

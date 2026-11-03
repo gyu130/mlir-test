@@ -225,6 +225,91 @@ def MatMulTensorOp : Op<MyDialect, "matmul_tensor", [
   let assemblyFormat = "$A `,` $B attr-dict `:` type($A) `,` type($B) `->` type($Y)";
 }
 
+//===================== 张量 reduce_max reduce_max_tensor =====================
+// 与 reduce_sum_tensor 同构，但归约用 max 而非 sum。
+def ReduceMaxTensorOp : Op<MyDialect, "reduce_max_tensor", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>
+]> {
+  let arguments = (ins
+    MyTensorType:$data,
+    ArrayAttr:$axes,
+    BoolAttr:$keep_dims
+  );
+  let results = (outs MyTensorType:$res);
+  let hasVerifier = 1;
+  let assemblyFormat = "$data `,` $axes `,` $keep_dims attr-dict `:` type($data) `->` type($res)";
+}
+
+//===================== 张量逐元素 exp exp_tensor =====================
+// 逐元素 exp(x)。LowerMyDialectPrint 里展开成循环 nest + math.exp。
+def ExpTensorOp : Op<MyDialect, "exp_tensor", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins MyTensorType:$x);
+  let results = (outs MyTensorType:$res);
+  let assemblyFormat = "$x attr-dict `:` type($res)";
+}
+
+//===================== 张量沿 axis 拼接 concat_tensor =====================
+// inputs 沿 axis 拼接成更大的张量。所有输入 shape 必须在除 axis 外的维度一致。
+// 结果 shape 推导：axis 维 = Σ inputs[*].shape[axis]，其余维 = inputs[0].shape。
+def ConcatTensorOp : Op<MyDialect, "concat_tensor", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>
+]> {
+  let arguments = (ins
+    Variadic<MyTensorType>:$inputs,
+    I64Attr:$axis
+  );
+  let results = (outs MyTensorType:$res);
+  let hasVerifier = 1;
+  let assemblyFormat = "$inputs `,` $axis attr-dict `:` type($inputs) `->` type($res)";
+}
+
+//===================== 基础 2D 卷积 conv2d_tensor =====================
+// 简化 NCHW 实现：
+//   input:  [N, C_in, H, W]
+//   weight: [C_out, C_in, kH, kW]  （group=1）
+//   output: [N, C_out, OH, OW]
+// OH = (H + pad_top + pad_bot - dil_h*(kH-1) - 1)/stride_h + 1
+// OW = (W + pad_left + pad_right - dil_w*(kW-1) - 1)/stride_w + 1
+// 仅支持 group=1；无 bias；属性 pads=[top,left,bottom,right], strides=[h,w], dilations=[h,w]
+// 结果 shape 推导由手写 inferReturnTypes 实现。
+def Conv2dTensorOp : Op<MyDialect, "conv2d_tensor", [
+  Pure,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>
+]> {
+  let arguments = (ins
+    MyTensorType:$input,
+    MyTensorType:$weight,
+    OptionalAttr<ArrayAttr>:$pads,
+    DefaultValuedAttr<ArrayAttr, "{}">:$strides,
+    DefaultValuedAttr<ArrayAttr, "{}">:$dilations
+  );
+  let results = (outs MyTensorType:$output);
+  let hasVerifier = 1;
+  let assemblyFormat = "$input `,` $weight attr-dict `:` type($input) `,` type($weight) `->` type($output)";
+}
+
+//===================== Softmax softmax_tensor =====================
+// softmax(x, axis) = exp(x - max(x,axis)) / sum(exp(x - max(x,axis)), axis)
+// 简化实现：axis 为最后一维或任意指定维。结果 shape = 输入 shape
+// （apply softmax 到 axis 维，其他维保持不变）。
+// Lowering: 3 次扫描——先找 max(沿 axis)，再 exp + sum，最后 div。
+def SoftmaxTensorOp : Op<MyDialect, "softmax_tensor", [
+  Pure,
+  SameOperandsAndResultType
+]> {
+  let arguments = (ins
+    MyTensorType:$x,
+    I64Attr:$axis
+  );
+  let results = (outs MyTensorType:$res);
+  let assemblyFormat = "$x `,` $axis attr-dict `:` type($res)";
+}
+
 
 // ===================== 循环算子：对标 ONNX Loop =====================
 // 注意：本算子不同于 mydialect.td 中既有的标量 ForOp/YieldOp，必须使用
