@@ -58,6 +58,8 @@ add_library(MyDialectLib
   FusionPass.cpp
   TilePass.cpp
   LoopOptimizePass.cpp
+  LowerAffineForPass.cpp
+  AffineOptimizePass.cpp
   ParallelPass.cpp
   SchedulePass.cpp
   PlaceDevicePass.cpp
@@ -87,6 +89,7 @@ target_link_libraries(MyDialectLib
     MLIRPass
     MLIRTransforms
     MLIRAffineDialect
+    MLIRAffineUtils
     MLIRSCFDialect
     MLIRVectorDialect
 )

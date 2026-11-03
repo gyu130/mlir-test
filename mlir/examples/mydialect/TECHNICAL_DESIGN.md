@@ -280,6 +280,8 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 | `LowerDevicePass` | `--mydialect-lower-device` | 部署目标落地：cpu 内联 `device_exec`，其它保留边界 |
 | `TilePass` | `--mydialect-tile` | 对最外层 elementwise `scf.for` 做 strip-mine 分块 |
 | `LoopOptimizePass` | `--mydialect-loop-optimize` | 循环融合 / 交换 / SIMD 向量化 |
+| `ForToAffinePass` | `--mydialect-for-to-affine` | 常量正 step 的 `mydialect.for` 降级为 `affine.for` |
+| `AffineOptimizePass` | `--mydialect-affine-opt` | affine.for 上的融合 / 分块 / 向量化 |
 | `ParallelPass` | `--mydialect-parallelize` | 合法循环提升为 `scf.forall` |
 | `SchedulePass` | `--mydialect-schedule` | 基本块级 list scheduling（FU + 延迟模型） |
 | `ConvertOnnxToMyDialectPass` | `--convert-onnx-to-mydialect` | ONNX stub → mydialect |
@@ -381,6 +383,37 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 新鲜 `alloc`/`alloca` 与任何预先存在的值（函数参数、其他分配、global）不别名，
 两个不同新鲜分配也不别名，其余视为可能别名。向量化使用循环外的零值作为
 `transfer_read` 的 padding。
+
+### 5.7 Affine 方言集成
+
+`--mydialect-for-to-affine` 把 `mydialect.for` 转成 `affine.for`，将循环交给 affine
+方言的循环分析（affine map 边界、依赖分析、trip count 推导）及变换工具：
+
+- **转换条件**：step 是正的编译期常量（affine.for 只接受常量 step）；lb/ub 能写成
+  affine 作用域内的合法 dim。i32 边界在作用域顶层做 `arith.index_cast` 后成为合法
+  dim；若边界是 `index_cast(index→i32)` 的结果（嵌套循环里外层 IV 作内层边界），
+  直接复用源 index 值，使其成为合法的 affine IV dim。
+- **保留条件**：动态/负 step、边界定义在嵌套 region 内等无法分析的情形保持
+  `mydialect.for`，后续由 `--lower-mydialect-print` 走 `scf.for`，保持向后兼容。
+- **转换结果**：affine IV 为 index 类型，body 内 `arith.index_cast` 回 i32 供
+  mydialect 算子使用；`iter_args` 数量/类型不变，`mydialect.yield` 换成
+  `affine.yield`。
+
+`--mydialect-affine-opt` 在 affine.for 上按 **融合 → 向量化 → 分块** 顺序执行三类
+变换（各自独立开关，默认全开）：
+
+| 变换 | 选项 | 触发条件 | 实现 |
+|------|------|----------|------|
+| 融合 | `fusion` | 相邻、无结果、lb/ub/step 等价的 affine.for，且写集合与对方读/写集合均不别名 | 手写 inline（`affine::fuseLoops` 需要构造 `ComputationSliceState`，成本过高） |
+| 向量化 | `vectorize` + `vector-width` | 常量 lb/ub、step=1、trip count 为宽度整数倍；body 为 load(s) + 纯算 + 恰好 1 个 store，最后一维索引恰为 IV | load → `vector.transfer_read`、结果类型改 `vector<VxT>`、store → `vector.transfer_write` |
+| 分块 | `tiling` + `tile-size` | 完美嵌套 affine.for band，且 band 内所有循环 step=1 | 调用 affine 官方 `affine::tilePerfectlyNested`（strip-mine 出分块循环 + 块内循环，`min(iv+K, ub)` 处理尾块） |
+
+先向量化再分块，是因为向量化依赖常量 trip count，而分块会生成 `min(iv+K, ub)`
+形式的动态内层边界；分块跳过 step≠1 的 band，避免对已向量化的循环再次 strip-mine
+产生退化的单次迭代内层循环。
+
+Affine 路径是 opt-in 的：`affine.for` 还需 `--lower-affine`（AffineToStandard）才能
+进入 LLVM 后端；默认流水线仍走 `scf.for`，因此既有测试与 JIT 不受影响。
 
 ---
 
@@ -796,6 +829,9 @@ mlir-opt --mydialect-place-device test/device/place_basic.mlir
 mlir-opt --mydialect-lower-device test/device/place_keep_device.mlir
 mlir-opt --mydialect-tile test/tile/tile_1d.mlir
 mlir-opt --mydialect-loop-optimize="fusion=true interchange=true vectorize=true vector-width=4" loop.mlir
+mlir-opt --mydialect-for-to-affine test/affine/for_to_affine.mlir
+mlir-opt --mydialect-affine-opt="fusion=true tiling=true vectorize=true tile-size=4 vector-width=4" affine.mlir
+mlir-opt --mydialect-for-to-affine --mydialect-affine-opt --lower-affine affine.mlir
 mlir-opt --mydialect-parallelize test/parallel/parallelize_basic.mlir
 mlir-opt --mydialect-schedule test/schedule/schedule_reorder.mlir
 mlir-opt --mydialect-count-op-cycle-est --add-fu=2 --mul-fu=1 test.mlir

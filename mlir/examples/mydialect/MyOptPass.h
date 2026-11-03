@@ -13,6 +13,10 @@ std::unique_ptr<mlir::Pass> createFusionElementwisePass();
 std::unique_ptr<mlir::Pass> createTilePass();
 // --mydialect-loop-optimize：循环融合 / 交换 / 向量化
 std::unique_ptr<mlir::Pass> createLoopOptimizePass();
+// --mydialect-for-to-affine：把 mydialect.for 降级为 affine.for
+std::unique_ptr<mlir::Pass> createForToAffinePass();
+// --mydialect-affine-opt：affine.for 上的融合 / 分块 / 向量化
+std::unique_ptr<mlir::Pass> createAffineOptimizePass();
 // --mydialect-parallelize：把可安全并行的 elementwise scf.for 提升为 scf.forall
 std::unique_ptr<mlir::Pass> createParallelPass();
 // --mydialect-schedule：基本块级 list scheduling（FU 数量 + 延迟模型）
