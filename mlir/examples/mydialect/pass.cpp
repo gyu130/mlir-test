@@ -562,6 +562,77 @@ struct ConstantUnrollForPattern : public mlir::OpRewritePattern<mydialect::ForOp
   }
 };
 
+// ---------- LICM helpers: aliasing analysis ----------
+// Strip memref view-like ops to reach the underlying memref.
+static mlir::Value stripMemrefViews(mlir::Value v) {
+  while (mlir::Operation *def = v.getDefiningOp()) {
+    if (llvm::isa<mlir::memref::SubViewOp, mlir::memref::ViewOp,
+                  mlir::memref::CastOp, mlir::memref::ReinterpretCastOp>(def)) {
+      v = def->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return v;
+}
+
+// Whether the memref comes from a fresh allocation (alloc / alloca).
+static bool isFreshAlloc(mlir::Value v) {
+  if (auto defOp = v.getDefiningOp())
+    return llvm::isa<mlir::memref::AllocOp, mlir::memref::AllocaOp,
+                     mydialect::AllocOp>(defOp);
+  return false;
+}
+
+// Conservative aliasing test: a fresh allocation never aliases any
+// pre-existing value (function argument, other allocation, global);
+// two distinct fresh allocations also never alias.
+static bool mayAlias(mlir::Value a, mlir::Value b) {
+  if (a == b)
+    return true;
+  mlir::Value baseA = stripMemrefViews(a);
+  mlir::Value baseB = stripMemrefViews(b);
+  if (baseA == baseB)
+    return true;
+  if (isFreshAlloc(baseA) || isFreshAlloc(baseB))
+    return false;
+  return true;
+}
+
+// Does the loop body possibly write `memref`?
+//  - explicit store whose base may alias `memref` -> write
+//  - op with unknown side effects (call / print)     -> write (conservative)
+//  - loads and pure ops                              -> not a write
+static bool loopMayWriteMemref(mlir::Region &body, mlir::Value memref) {
+  bool mayWrite = false;
+  body.walk([&](mlir::Operation *op) {
+    // 终止符（yield）本身无内存副作用，但它不实现 MemoryEffectOpInterface，
+    // isMemoryEffectFree 会保守返回 false，必须显式跳过。
+    if (op->hasTrait<mlir::OpTrait::IsTerminator>())
+      return;
+    mlir::Value stored;
+    if (auto store = llvm::dyn_cast<mlir::memref::StoreOp>(op))
+      stored = store.getMemref();
+    else if (auto store = llvm::dyn_cast<mydialect::StoreOp>(op))
+      stored = store.getMemref();
+    else if (auto store = llvm::dyn_cast<mydialect::HwStoreOp>(op))
+      stored = store.getMemref();
+
+    if (stored) {
+      if (mayAlias(stored, memref))
+        mayWrite = true;
+      return;
+    }
+    // memref.load / mydialect.load / hw_load are read-only here
+    if (llvm::isa<mlir::memref::LoadOp, mydialect::LoadOp,
+                  mydialect::HwLoadOp>(op))
+      return;
+    if (!mlir::isMemoryEffectFree(op))
+      mayWrite = true;
+  });
+  return mayWrite;
+}
+
 struct LoopInvariantHoistPattern : public mlir::OpRewritePattern<mydialect::ForOp> {
   using OpRewritePattern<mydialect::ForOp>::OpRewritePattern;
   bool isDefinedOutside(mlir::Value val, mlir::Region &loopBody) const {
@@ -578,8 +649,7 @@ struct LoopInvariantHoistPattern : public mlir::OpRewritePattern<mydialect::ForO
     mlir::Region &bodyRegion = forOp.getBody();
     mlir::Block &bodyBlock = bodyRegion.front();
     llvm::SmallVector<mlir::Operation*,8> hoistCandidates;
-    for(auto &op : bodyBlock){
-        if(llvm::isa<mydialect::YieldOp>(op)) break;
+    for(auto &op : bodyBlock.without_terminator()){
         bool allOutside = true;
         for(auto operand : op.getOperands()){
             if(!isDefinedOutside(operand, bodyRegion)){
@@ -587,9 +657,23 @@ struct LoopInvariantHoistPattern : public mlir::OpRewritePattern<mydialect::ForO
                 break;
             }
         }
-        if(allOutside){
-            hoistCandidates.push_back(&op);
+        if(!allOutside) continue;
+
+        // Side-effect gate:
+        //  - pure ops                    -> hoist
+        //  - load (memref/mydialect/hw)  -> hoist only if no possibly-aliasing
+        //                                   write inside the loop
+        //  - store / call / print        -> never hoist
+        bool isLoad = llvm::isa<mlir::memref::LoadOp, mydialect::LoadOp,
+                                mydialect::HwLoadOp>(op);
+        if (isLoad) {
+            // operand 0 of all three load ops is the memref being read
+            if (loopMayWriteMemref(bodyRegion, op.getOperand(0)))
+                continue;
+        } else if (!mlir::isMemoryEffectFree(&op)) {
+            continue;
         }
+        hoistCandidates.push_back(&op);
     }
     if(hoistCandidates.empty()) return mlir::failure();
     rewriter.setInsertionPoint(forOp);

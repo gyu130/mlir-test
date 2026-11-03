@@ -61,11 +61,15 @@ MyDialect 是一个在 LLVM/MLIR 框架上从零构建的自定义方言（Diale
                             │  Pass 流水线
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  高层优化 Pass                                                    │
-│   MyOptPass: 冗余 print 删除 + arith.addi CSE                     │
+│  优化与转换 Pass（按 --opt-level 组织）                            │
+│   MyOptPass: 冗余 print 删除 + arith.addi CSE + 代数化简           │
 │   ConstantFoldMyDialectPass: 常量折叠/循环求值/展开/不变式外提      │
+│   LayoutPropagationPass: transpose 提升/复合/恒等消去              │
+│   FusionElementwisePass: add/mul 张量链 → fused_elementwise        │
+│   PlaceDevicePass: hw_mul 闭包 → device_exec region               │
 │   LowerHwMulPass: hw_mul → arith.muli (SW) 或 llvm intrinsic (HW) │
 │   OpCountCycleEstimatePass: 算子计数与周期估算                     │
+│   TilePass / ParallelPass / SchedulePass: 分块/并行化/指令调度      │
 └───────────────────────────┬─────────────────────────────────────┘
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -174,11 +178,13 @@ MyTensorType<[dims], elemTy>  ──→  memref<dims x elemTy>
 
 | 算子 | 语义 | 降级目标 |
 |------|------|----------|
-| `mydialect.alloc %size : memref<?xi32>` | 一维数组分配 | `memref.alloca`（size 经 `arith.index_cast` 转 index） |
-| `mydialect.load %buf, %idx : memref<?xi32>, i32` | 数组读 | `memref.load` |
-| `mydialect.store %val, %buf, %idx` | 数组写 | `memref.store` |
+| `mydialect.alloc %n, %m : memref<?x?xi32>` | N 维数组分配 | `memref.alloca`（每个 size 经 `arith.index_cast` 转 index） |
+| `mydialect.load %buf, %i, %j : memref<?x?xi32>, i32` | 数组读 | `memref.load` |
+| `mydialect.store %val, %buf, %i, %j` | 数组写 | `memref.store` |
 
-`AllocOp`/`LoadOp`/`StoreOp` 均有 verifier，限制为 1 维 i32 memref。
+`AllocOp`/`LoadOp`/`StoreOp` 均有 verifier：支持任意 rank 的 i32 memref；
+`alloc` 的尺寸操作数个数必须等于结果 memref 的动态维度个数，
+`load`/`store` 的索引个数必须等于 memref 的 rank。
 
 ### 4.3 循环算子
 
@@ -222,6 +228,7 @@ mydialect.loop %maxTrip, %cond, %initArgs : (!mydialect.tensor<...>) -> (!mydial
 | `reshape_tensor` | 形状重排 | 无（运行时 shape） | （ONNX 用） |
 | `transpose_tensor` | 转置 | 手写 `inferReturnTypes` | （ONNX 用） |
 | `reduce_sum_tensor` | 归约求和 | 手写 `inferReturnTypes` | （ONNX 用） |
+| `fused_elementwise` | 融合的逐元素链（变参输入 + region） | 结果类型显式 | memref + 单个循环 nest |
 
 **关键设计**：
 - `SameOperandsAndResultType` trait 自动提供 `InferTypeOpInterface` 默认实现
@@ -244,11 +251,15 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 | `mydialect.print %val : type` | 打印整数/张量 | `llvm.call @my_runtime_print_i32`（张量逐元素打印，生成嵌套 scf.for） |
 | `mydialect.print_str` | 打印字符串 | `llvm.call @my_runtime_print_string` |
 
-### 4.7 硬件加速算子（MyDialectHwOps.td）
+### 4.7 硬件加速算子与异构部署算子
 
-| 算子 | 语义 | 降级路径 |
-|------|------|----------|
+| 算子 | 语义 | 降级路径 / 用途 |
+|------|------|----------------|
 | `mydialect.hw_mul %a, %b : i32` | 硬件 i32 乘法 | SW: `arith.muli`；HW: `llvm.call_intrinsic "llvm.mydialect.hw.mul.i32"` |
+| `mydialect.device_exec` | 设备子图容器（单块 region + `StrAttr device` + 变参结果） | 终止符 `device_yield`；cpu 目标内联、其它保留边界 |
+| `mydialect.device_yield` | `device_exec` 终止符，产出逃逸值 | 与 `device_exec` 结果个数/类型一致 |
+
+`device_exec`/`device_yield` 由 `PlaceDevicePass` 自动生成，`DeviceExecOp::verify()` 强校验终止符为 `device_yield` 且操作数个数、类型与结果一致。
 
 ---
 
@@ -258,11 +269,19 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 
 | Pass | 命令行参数 | 功能 |
 |------|-----------|------|
-| `MyOptPass` | `--my-opt` | 冗余 print 删除 + arith.addi 块内 CSE |
-| `ConstantFoldMyDialectPass` | `--constant-fold-mydialect` | 算术常量折叠、循环常量求值/展开、循环不变式外提 |
+| `MyOptPass` | `--my-opt` | 冗余 print 删除 + arith.addi 块内 CSE + 代数化简 |
+| `ConstantFoldMyDialectPass` | `--constant-fold-mydialect` | 算术/张量常量折叠、循环常量求值/展开、循环不变式外提 |
+| `LayoutPropagationPass` | `--mydialect-layout-propagation` | 布局转换提升出 elementwise、相邻转换复合、恒等置换消去 |
+| `FusionElementwisePass` | `--mydialect-fuse-elementwise` | add/mul 张量 producer-consumer 链融合为 `fused_elementwise` |
+| `PlaceDevicePass` | `--mydialect-place-device` | 以 hw_mul 为种子把设备闭包包进 `device_exec` region |
 | `LowerHwMulPass` | `--lower-hw-mul` | hw_mul 双路径 lowering（`--use-hardware-path`） |
 | `OpCountCycleEstimatePass` | `--mydialect-count-op-cycle-est` | 算子计数 + 硬件周期估算 |
 | `LowerMyDialectPrintPass` | `--lower-mydialect-print` | 核心降级：mydialect → scf/memref/arith/llvm |
+| `LowerDevicePass` | `--mydialect-lower-device` | 部署目标落地：cpu 内联 `device_exec`，其它保留边界 |
+| `TilePass` | `--mydialect-tile` | 对最外层 elementwise `scf.for` 做 strip-mine 分块 |
+| `LoopOptimizePass` | `--mydialect-loop-optimize` | 循环融合 / 交换 / SIMD 向量化 |
+| `ParallelPass` | `--mydialect-parallelize` | 合法循环提升为 `scf.forall` |
+| `SchedulePass` | `--mydialect-schedule` | 基本块级 list scheduling（FU + 延迟模型） |
 | `ConvertOnnxToMyDialectPass` | `--convert-onnx-to-mydialect` | ONNX stub → mydialect |
 
 所有 Pass 通过 TableGen `MyDialectPasses.td` / `MyOptPass.td` 声明，并在各自 TU 内静态注册（`static bool _registered = []() { registerXxxPass(); return true; }();`），确保 `mlir-opt` 启动时自动可用。
@@ -304,21 +323,64 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 2. `ConstantFoldMyDialectPattern`：print op 的常量识别（调试用）
 3. `ConstantEvaluateForPattern`（benefit=2）：常量边界 + 常量 iter_args + 纯算术循环体 → 解释执行算出结果常量，迭代上限 MAX_EVAL_ITER=16
 4. `ConstantUnrollForPattern`（benefit=1）：常量边界循环展开，迭代上限 MAX_UNROLL=16
-5. `LoopInvariantHoistPattern`：循环不变式外提
+5. `LoopInvariantHoistPattern`：循环不变式外提。纯算子（`isMemoryEffectFree`）直接外提；
+   `memref.load`/`mydialect.load`/`hw_load` 仅当循环体内没有可能别名的写入时外提
+   （新鲜 `alloc`/`alloca` 与任何预先存在的 memref 均不别名），store/call/print 一律不外提；
+   扫描时跳过 `yield` 终止符（它不实现 `MemoryEffectOpInterface`）
 
 ### 5.4 完整驱动流水线（main.cpp）
 
 ```
-MyOptPass
-  → ConstantFoldMyDialectPass
-  → LowerHwMulPass          (必须在 LowerMyDialectPrint 之前)
-  → OpCountCycleEstimatePass
-  → LowerMyDialectPrintPass
-  → Canonicalizer
-  → SCFToControlFlow
-  → ConvertToLLVM
-  → ExecutionEngine JIT
+[local] MyOptPass → ConstantFoldMyDialectPass → CSE → SymbolDCE
+[local]   → LayoutPropagationPass
+[graph] → FusionElementwisePass
+[device]→ PlaceDevicePass
+        → LowerHwMulPass            (必须在 LowerMyDialectPrint 之前)
+        → OpCountCycleEstimatePass
+        → LowerMyDialectPrintPass
+[device]→ LowerDevicePass            (cpu 目标内联 device_exec)
+[graph] → TilePass
+[graph] → ParallelPass
+        → LowerAffinePass → Canonicalizer
+[graph] → SchedulePass
+        → SCFToControlFlow → ConvertToLLVM
+        → ExecutionEngine JIT
 ```
+
+`[local]`/`[graph]`/`[device]` 标记的 pass 由 `--opt-level` 档位控制：
+
+| 档位 | 行为 |
+|------|------|
+| `--opt-level=0` | 仅做必要方言降级（不做任何可选优化） |
+| `--opt-level=1` | 局部/图清理：MyOpt、常量折叠、CSE、SymbolDCE、layout 传播 |
+| `--opt-level=2`（默认） | 全量图优化：在 1 的基础上加算子融合、tiling、并行化、指令调度 |
+
+`--parallelize` / `--schedule` / `--layout-propagation` / `--device-placement` 等 granular 开关在命令行显式给出时优先于档位，未给出时由档位派生。
+
+### 5.5 图优化 Pass 细节
+
+- **LayoutPropagationPass**：`E(transpose(x,p), transpose(y,p)) → transpose(E(x,y), p)`（N 个输入转换合并为 1 个）；`transpose(transpose(x,p1),p2) → transpose(x,p1∘p2)`（`composed[m]=p1[p2[m]]`）；恒等置换直接消去。布局转换只在非 elementwise 边界（print/reshape/reduce）按需物化。位于算子融合之前，用于暴露可融合链。
+- **FusionElementwisePass**：把 add/mul 张量的 producer-consumer 链合并为单个 `fused_elementwise`（变参输入 + region 内标量计算），lowering 时只生成一个循环 nest，中间结果不落地 memref。
+- **PlaceDevicePass / LowerDevicePass**：以 `hw_mul` 为种子沿纯算子 def-use 双向闭包，把连续设备段包装为 `device_exec`（终止符 `device_yield` 提升逃逸值）；`--device-target=cpu` 时内联回 host（JIT 可执行），其它目标保留 host/device 边界。
+- **TilePass**：对最外层 elementwise `scf.for` 做 strip-mine，用 `affine.min` 处理尾块边界。
+- **ParallelPass**：无 iter_args 且无外部调用的循环提升为 `scf.forall`（由 SCFToControlFlow 串行展开）。
+- **SchedulePass**：基本块级 list scheduling，以 store/call/带 region 的 op 为屏障切段，仅在段内重排纯算术与 load，保持依赖不变。
+
+### 5.6 循环优化 Pass 细节
+
+`--mydialect-loop-optimize` 面向 lowering 后生成的 elementwise `scf.for` nest，
+三个阶段各自独立开关（`fusion` / `interchange` / `vectorize`，默认全开），依次执行：
+
+| Pattern | 触发条件 | 变换 |
+|---------|----------|------|
+| `LoopFusionPattern` | 相邻两个无 iter_args 的 `scf.for`，lb/ub/step 等价，且两循环的写集合与对方读/写集合均不别名 | 把第二个循环 body 内联到第一个循环 body 末尾（IV 用第一个循环的 IV 替换），删除第二个循环 |
+| `LoopInterchangePattern` | 完美嵌套两层循环（外层体除内层 `scf.for` 外只有纯算子），两层均无结果，body 内写集合与读集合不别名（无原地更新）；且外层 IV 出现在 memref 最内维索引的次数多于内层 IV | 新外层取原内层边界、新内层取原外层边界，按 `IRMapping` 交换两个 IV 后顺序克隆两层 body |
+| `VectorizeInnerLoopPattern` | 最内层循环 lb/ub/step 为常量且 step=1，trip count 是 `vector-width` 的整数倍；body 为 load(s) + 纯标量算子 + 恰好 1 个 store，所有访问的最后一维索引恰为 IV、其余索引循环不变 | 步长改为 `vector-width`，load → `vector.transfer_read`、纯算子结果类型改为 `vector<VxelemTy>`、store → `vector.transfer_write` |
+
+别名判断是保守的：`memref.subview/view/cast/reinterpret_cast` 先剥离到底层 memref；
+新鲜 `alloc`/`alloca` 与任何预先存在的值（函数参数、其他分配、global）不别名，
+两个不同新鲜分配也不别名，其余视为可能别名。向量化使用循环外的零值作为
+`transfer_read` 的 padding。
 
 ---
 
@@ -356,9 +418,16 @@ MyOptPass
 
 ---
 
-## 7. 硬件加速算子 hw_mul 双路径 lowering
+## 7. 硬件加速算子族 SW/HW 双路径 lowering
 
-`mydialect.hw_mul` 是硬件乘法原语，支持两条独立 lowering 路径，由 `LowerHwMulPass` 的 `useHardwarePath` 选项控制：
+`LowerHwMulPass` 覆盖整个硬件算子族，两条独立 lowering 路径由 `useHardwarePath` 选项控制：
+
+| 算子族 | 成员 | SW 路径（默认） | HW 路径（`use-hardware-path=true`） |
+|--------|------|----------------|-----------------------------------|
+| 标量算术 | `hw_mul` / `hw_add` / `hw_div` | `arith.muli` / `arith.addi` / `arith.divsi` | `llvm.call_intrinsic "llvm.mydialect.hw.<op>.i32"` |
+| 标量位运算 | `hw_and` / `hw_or` / `hw_xor` | `arith.andi` / `arith.ori` / `arith.xori` | 同上 |
+| 矩阵单元 | `hw_matmul`（C = A×B，2-D i32 memref，verifier 校验 M/K/N 匹配） | 清零 + `scf.for` 三层循环（`memref.dim` 取上界，支持动态 shape） | `func.call @mydialect.hw.matmul`（模块级 private 声明） |
+| DMA 搬运 | `hw_load` / `hw_store`（索引数 == rank，i32 memref） | `memref.load` / `memref.store`（索引经 `arith.index_cast`） | `func.call @mydialect.hw.dma.load/store` |
 
 ### 7.1 软件路径（默认）
 
@@ -366,19 +435,23 @@ MyOptPass
 mydialect.hw_mul %a, %b : i32   →   arith.muli %a, %b : i32
 ```
 
-`HwMulToArithMuli` pattern（`OpRewritePattern`）直接替换为 `arith.muli`，后续走标准 arith→LLVM 链路，在 CPU 上 JIT 执行。
+`HwScalarToArith` 模板 pattern（`OpRewritePattern`）直接替换为对应 arith op，后续走标准 arith→LLVM 链路，在 CPU 上 JIT 执行。hw_matmul 的 SW 路径生成两层清零循环 + 三层累加循环（K 最内层），纯软件模拟矩阵单元。
 
-### 7.2 硬件路径（`--use-hardware-path=true`）
+### 7.2 硬件路径（`--lower-hw-mul="use-hardware-path=true"`）
+
+标量族生成 `llvm.call_intrinsic`，对应 RISC-V 自定义指令或 ISS 仿真：
 
 ```
 mydialect.hw_mul %a, %b : i32   →   llvm.call_intrinsic "llvm.mydialect.hw.mul.i32"(%a, %b) : i32
 ```
 
-`HwMulToLLVMIntrinsic` pattern 生成 `llvm.call_intrinsic`，对应 RISC-V 自定义指令或 ISS 仿真。
+hw_matmul 与 hw_load/hw_store 的操作数含 memref，无法用 LLVM intrinsic 承载，改为 `func.call` 到模块级 private 外部符号（`mydialect.hw.matmul` / `mydialect.hw.dma.load` / `mydialect.hw.dma.store`），声明由 `getOrCreateDecl` 按需创建（签名不匹配时报错），等价于设备 kernel 启动 / DMA 引擎调用边界。
 
 ### 7.3 流水线位置
 
-`LowerHwMulPass` 必须在 `LowerMyDialectPrintPass` **之前**执行：hw_mul 先 lower 成 arith.muli / llvm.intrinsic，然后 LowerMyDialectPrint 处理 SimpleCParser 生成的 tensor_to_scalar / scalar_to_tensor 桥接 op。
+`LowerHwMulPass` 必须在 `LowerMyDialectPrintPass` **之前**执行：hw 算子先 lower 成 arith / llvm.intrinsic / func.call，然后 LowerMyDialectPrint 处理 SimpleCParser 生成的 tensor_to_scalar / scalar_to_tensor 桥接 op。
+
+`PlaceDevicePass` 的 device placement 种子同样覆盖整个 hw 算子族（`isHwOp`），沿纯算子 def-use 边扩展闭包后包进 `device_exec` 区域。
 
 ---
 
@@ -526,10 +599,26 @@ mydriver --concurrent-jit --jit-mlir-files=a.mlir,b.mlir,c.mlir --jit-threads=4 
 
 **`test/myopt/redundant_print.mlir`**：连续相同 print 删除。
 **`test/myopt/addi_cse.mlir`**：块内相同 addi 公共子表达式消除。
+**`test/myopt/algebraic_simplify.mlir`**：identity 透传、双重互逆 transpose 消去、链式 reshape 合并。
 
 ### 11.9 周期估算用例
 
 **`test/analysis/op_count_cycle.mlir`**：含 addi/muli 的模块，运行 `--mydialect-count-op-cycle-est` 输出周期报告。
+
+### 11.10 图优化用例
+
+- **`test/fold/tensor_const_fold.mlir` / `tensor_const_fold_fp.mlir`**：整数/浮点张量常量逐元素折叠
+- **`test/fusion/{fuse_elementwise,fused_roundtrip,fused_lowering,no_fusion}.mlir`**：producer-consumer 融合、往返解析、融合体 lowering、不可融合保护
+- **`test/layout/{hoist_elementwise,compose_perm,materialize_boundary}.mlir`**：布局提升、相邻置换复合、边界按需物化
+- **`test/tile/{tile_1d,tile_2d_outermost,tile_small_and_option}.mlir`**：strip-mine 分块与尾块边界
+- **`test/parallel/{parallelize_basic,parallelize_skip,parallelize_openmp,parallel_tile_combo}.mlir`**：`scf.forall` 提升与跳过条件
+- **`test/schedule/{schedule_reorder,schedule_barrier,schedule_stats}.mlir`**：段内重排、屏障切段、调度统计
+
+### 11.11 异构部署用例
+
+- **`test/device/place_basic.mlir`**：hw_mul 闭包 → `device_exec`/`device_yield`
+- **`test/device/place_cpu_inline.mlir`**：`--mydialect-lower-device target=cpu` 内联 region
+- **`test/device/place_keep_device.mlir`**：非 cpu 目标保留 host/device 边界
 
 ---
 
@@ -678,21 +767,37 @@ mydriver --concurrent-jit --jit-mlir-files=a.mlir,b.mlir,c.mlir --jit-threads=4 
 mydriver --parse-c test_hw.c > test_hw.mlir
 
 # 2. 端到端 lowering + JIT 执行
-mydriver test_hw.mlir
+mydriver --parse-mlir test_hw.mlir
 
 # 3. 指定入口函数和参数
-mydriver loop.mlir 10 main
+mydriver --parse-mlir loop.mlir 10 main
 
 # 4. 硬件 intrinsic 路径
-mydriver --hw-lower test_hw.mlir
+mydriver --hw-lower --parse-mlir test_hw.mlir
 
-# 5. 并发 JIT
+# 5. 优化档位（0=仅降级，1=局部优化，2=全量图优化，默认 2）
+mydriver --parse-mlir tensor.mlir --opt-level=0
+mydriver --parse-mlir tensor.mlir --opt-level=1
+
+# 6. 异构部署控制
+mydriver --parse-mlir test_hw.mlir --device-placement=false
+mydriver --parse-mlir test_hw.mlir --device-target=gpu
+
+# 7. 并发 JIT
 mydriver --concurrent-jit --jit-mlir-files=a.mlir,b.mlir --jit-threads=4
 
-# 6. 用 mlir-opt 单独跑 Pass
+# 8. 用 mlir-opt 单独跑 Pass
 mlir-opt --lower-hw-mul test.mlir
 mlir-opt --convert-onnx-to-mydialect onnx_loop.mlir
 mlir-opt --lower-mydialect-print tensor.mlir
+mlir-opt --mydialect-layout-propagation test/layout/hoist_elementwise.mlir
+mlir-opt --mydialect-fuse-elementwise test/fusion/fuse_elementwise.mlir
+mlir-opt --mydialect-place-device test/device/place_basic.mlir
+mlir-opt --mydialect-lower-device test/device/place_keep_device.mlir
+mlir-opt --mydialect-tile test/tile/tile_1d.mlir
+mlir-opt --mydialect-loop-optimize="fusion=true interchange=true vectorize=true vector-width=4" loop.mlir
+mlir-opt --mydialect-parallelize test/parallel/parallelize_basic.mlir
+mlir-opt --mydialect-schedule test/schedule/schedule_reorder.mlir
 mlir-opt --mydialect-count-op-cycle-est --add-fu=2 --mul-fu=1 test.mlir
 ```
 
@@ -735,6 +840,14 @@ mlir-opt --mydialect-count-op-cycle-est --add-fu=2 --mul-fu=1 test.mlir
 
 - **ExecutionEngine::registerSymbols 用回调形式**：`SymbolMap(MangleAndInterner)`，符号名须与 IR 引用一致
 - **LLVM 22 的 CodeGenOptLevel 是 enum class**：用 `llvm::CodeGenOpt::getLevel(int)` 转换
+
+### 14.7 图优化与异构部署
+
+- **布局传播复合公式**：`composed[m] = p1[p2[m]]`；提升条件要求所有操作数为同构 transpose（perm 相同），结果布局转换只在对下游真正生效前落地
+- **device_exec 的 region 必须用 `op.getBody()`**：`OperationState::addRegion()` 的 region 在 `Operation::create` 中被 `takeBody` 掏空
+- **`iplist::splice` 接收者必须是目标 list**：`body->getOperations().splice(...)`，否则 `transferNodesFromList` 提前返回，Operation 的 block 指针残留旧块并触发 dominance 误报
+- **纯算子闭包的判定依赖 `isMemoryEffectFree`**：未声明 `Pure` trait 的 op 不会被判定为无副作用，需显式补齐
+- **opt-level 与 granular 开关**：档位提供默认，命令行显式给出的 granular 开关优先（`getNumOccurrences()` 判定）
 
 ---
 
