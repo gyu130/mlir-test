@@ -137,4 +137,7 @@ mlir_target_link_libraries(mlir-opt PRIVATE
   MLIRAffineDialect
   MLIRAffineUtils
   MLIRAffineAnalysis
+  MLIRGPUDialect
+  MLIRGPUTransforms
+  MLIRGPUUtils
 )

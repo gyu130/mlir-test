@@ -92,6 +92,9 @@ target_link_libraries(MyDialectLib
     MLIRAffineUtils
     MLIRSCFDialect
     MLIRVectorDialect
+    MLIRGPUDialect
+    MLIRGPUTransforms
+    MLIRGPUUtils
 )
 
 

@@ -277,7 +277,7 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 | `LowerHwMulPass` | `--lower-hw-mul` | hw_mul 双路径 lowering（`--use-hardware-path`） |
 | `OpCountCycleEstimatePass` | `--mydialect-count-op-cycle-est` | 算子计数 + 硬件周期估算 |
 | `LowerMyDialectPrintPass` | `--lower-mydialect-print` | 核心降级：mydialect → scf/memref/arith/llvm |
-| `LowerDevicePass` | `--mydialect-lower-device` | 部署目标落地：cpu 内联 `device_exec`，其它保留边界 |
+| `LowerDevicePass` | `--mydialect-lower-device` | 部署目标落地：cpu 内联 `device_exec`，gpu 生成 `gpu.launch` kernel，其它保留边界 |
 | `TilePass` | `--mydialect-tile` | 对最外层 elementwise `scf.for` 做 strip-mine 分块 |
 | `LoopOptimizePass` | `--mydialect-loop-optimize` | 循环融合 / 交换 / SIMD 向量化 |
 | `ForToAffinePass` | `--mydialect-for-to-affine` | 常量正 step 的 `mydialect.for` 降级为 `affine.for` |
@@ -414,6 +414,46 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 
 Affine 路径是 opt-in 的：`affine.for` 还需 `--lower-affine`（AffineToStandard）才能
 进入 LLVM 后端；默认流水线仍走 `scf.for`，因此既有测试与 JIT 不受影响。
+
+### 5.8 GPU 加速路径
+
+`LowerDevicePass` 新增 `target=gpu` 选项，把 `device_exec` region 内的
+`hw_matmul` 替换为手写 `gpu.launch` kernel（`gpu` 方言），形成三条路径：
+
+| hw_matmul 路径 | 触发条件 | 实现 |
+|---|---|---|
+| SW（软件模拟） | `--lower-hw-mul` 默认（无 `use-hardware-path`） | 清零 + `scf.for` 三层循环累加，纯软件模拟矩阵单元 |
+| HW（硬件外调） | `--lower-hw-mul="use-hardware-path=true"` | `func.call @mydialect.hw.matmul`（模块级 private 声明） |
+| **GPU（CUDA kernel）** | `--mydialect-place-device` → `--mydialect-lower-device=target=gpu` | **`gpu.launch` + 手写 kernel**（块/线程 ID + 边界检查 + 内层 K 循环累加） |
+
+**GPU kernel 结构**（[LowerDevicePass.cpp](../LowerDevicePass.cpp)）：
+```
+grid  = (ceil(M/16), ceil(N/16), 1)
+block = (16, 16, 1)
+每个 thread:
+  i = block_id.x * 16 + thread_id.x
+  j = block_id.y * 16 + thread_id.y
+  if (i < M && j < N)
+    for k = 0..K step 1: acc += A[i,k] * B[k,j]
+    C[i,j] = acc
+```
+
+M/K/N 用 `memref.dim` 运行时取，天然支持动态 shape；块/线程尺寸 `TB=16`（可调）；
+边界 `if (i<M && j<N)` 处理小矩阵和非整除 tile。
+
+**设计决策**：
+- **当前仅覆盖 `hw_matmul`**（memref 输入输出直接可用）；张量算子（带 `MyTensorType`）
+  的 GPU kernel 化需要先把张量 op lower 成 memref + scf.for，由
+  PlaceDevice → LowerMyDialectPrint → LowerDevice 协同实现，留作后续迭代。
+- 单标量 HW 算子（hw_add/hw_mul/hw_div/hw_and/hw_or/hw_xor/hw_load/hw_store）
+  粒度太细不值得 GPU kernel，保持原样交给 HW 路径（extern call）。
+- **不接 nvvm/rocdl lowering**：`gpu.launch` IR 生成到此为止，后续接
+  `--convert-gpu-to-nvvm` / `--convert-gpu-to-rocdl` 需要配置 target triple
+  和设备 SDK（当前 JIT 走 CPU 后端，不做 GPU runtime）。
+- `device_exec` host/device 边界在 GPU 路径下**保留**（不内联），方便用户识别 kernel 调用点。
+
+**库依赖**：CMakeLists.txt 链接 `MLIRGPUDialect`（含 `gpu.launch` / `gpu.block_id` /
+`gpu.thread_id` / `gpu.terminator` / `gpu.module` 等 op）。
 
 ---
 
