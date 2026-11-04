@@ -94,6 +94,26 @@ LogicalResult DeviceExecOp::verify() {
   return success();
 }
 
+// ---------------- DeviceCopyOp ----------------
+LogicalResult DeviceCopyOp::verify() {
+  auto srcTy = dyn_cast<mlir::MemRefType>(getSrc().getType());
+  auto dstTy = dyn_cast<mlir::MemRefType>(getDst().getType());
+  if (!srcTy) return emitOpError("src must be memref");
+  if (!dstTy) return emitOpError("dst must be memref");
+  if (srcTy.getShape() != dstTy.getShape())
+    return emitOpError("src/dst shape mismatch");
+  if (srcTy.getElementType() != dstTy.getElementType())
+    return emitOpError("src/dst element type mismatch");
+  return success();
+}
+
+// ---------------- DeviceAllocOp ----------------
+LogicalResult DeviceAllocOp::verify() {
+  auto bufTy = dyn_cast<mlir::MemRefType>(getBuffer().getType());
+  if (!bufTy) return emitOpError("result must be memref");
+  return success();
+}
+
 // ---------------- CmpITensorOp ----------------
 // 结果类型：与输入同 shape，但元素类型为 i1
 LogicalResult CmpITensorOp::inferReturnTypes(

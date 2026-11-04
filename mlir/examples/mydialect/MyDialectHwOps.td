@@ -158,5 +158,43 @@ def DeviceYieldOp : Op<MyDialect, "device_yield", [
   let assemblyFormat = "$values attr-dict `:` type($values)";
 }
 
+// ============ 分布式/异构执行原语 ============
+
+// host↔device / device↔device 数据搬运。
+// src / dst 必须是 memref；async=true 表示异步拷贝，后续需 device_wait 同步。
+// device_copy 不指定源/目的设备（由 HAL 从 memref 的设备描述推断），
+// 也不需要显式 buffer 分配（src/dst 由上层 device_alloc 或 host memref 给出）。
+def DeviceCopyOp : Op<MyDialect, "device_copy"> {
+  let summary = "Cross-device / host-device data transfer";
+  let description = [{
+    Copies memref content between host and device or between two devices.
+    This op does not specify src/dst devices explicitly — the runtime HAL
+    infers them from the backing buffer. `async=true` makes the copy
+    asynchronous; the op returns before the transfer finishes, and a
+    subsequent `device_wait` is required before the dst is read.
+  }];
+  let arguments = (ins AnyMemRef:$src, AnyMemRef:$dst, OptionalAttr<BoolAttr>:$async);
+  let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `->` type($dst)";
+  let hasVerifier = 1;
+}
+
+// 同步屏障：等待指定 device 或 "all" 上的所有异步 op（含 device_copy）完成。
+// 在 LowerDevicePass 里会 lower 成 extern call @mydialect.hal.wait。
+def DeviceWaitOp : Op<MyDialect, "device_wait"> {
+  let summary = "Device synchronization barrier";
+  let arguments = (ins StrAttr:$device);
+  let assemblyFormat = "$device attr-dict";
+}
+
+// 设备 buffer 分配：在指定 device 上分配 memref（返回 memref）。
+// 动态 shape 时 sizes 为 Variadic<i32>；静态 shape 时 sizes 可为空。
+def DeviceAllocOp : Op<MyDialect, "device_alloc"> {
+  let summary = "Allocate a buffer on a device";
+  let arguments = (ins StrAttr:$device, Variadic<I32>:$sizes);
+  let results = (outs AnyMemRef:$buffer);
+  let hasVerifier = 1;
+  let assemblyFormat = "$device $sizes attr-dict `:` type($buffer)";
+}
+
 #endif // MYDIALECT_HWOPS_TD
 

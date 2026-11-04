@@ -285,6 +285,7 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 | `ParallelPass` | `--mydialect-parallelize` | 合法循环提升为 `scf.forall` |
 | `SchedulePass` | `--mydialect-schedule` | 基本块级 list scheduling（FU + 延迟模型） |
 | `ConvertOnnxToMyDialectPass` | `--convert-onnx-to-mydialect` | ONNX stub → mydialect |
+| `DistributePass` | `--mydialect-distribute` | 跨 `device_exec` 自动插 `device_copy`（分布式/异构数据搬运） |
 
 所有 Pass 通过 TableGen `MyDialectPasses.td` / `MyOptPass.td` 声明，并在各自 TU 内静态注册（`static bool _registered = []() { registerXxxPass(); return true; }();`），确保 `mlir-opt` 启动时自动可用。
 
@@ -454,6 +455,89 @@ M/K/N 用 `memref.dim` 运行时取，天然支持动态 shape；块/线程尺�
 
 **库依赖**：CMakeLists.txt 链接 `MLIRGPUDialect`（含 `gpu.launch` / `gpu.block_id` /
 `gpu.thread_id` / `gpu.terminator` / `gpu.module` 等 op）。
+
+### 5.9 分布式 / 异构执行（HAL 风格）
+
+**ODS 原语**（[MyDialectHwOps.td](../MyDialectHwOps.td)）：
+
+| Op | 语义 | 参数 |
+|---|---|---|
+| `mydialect.device_exec "$device"` | 设备子图容器，`$device` 标识目标设备类型 | `StrAttr:$device` + Variadic 结果 + 单 block region |
+| `mydialect.device_alloc "$device"` | 在指定设备上分配静态 shape memref buffer | `StrAttr:$device` + 返回 `memref` |
+| `mydialect.device_copy %src, %dst` | host↔device / device↔device 数据搬运 | `src`、`dst`（同 shape/elem memref）+ 可选 `async` BoolAttr |
+| `mydialect.device_wait "$device"` | 同步屏障，等待该设备上所有异步 op 完成 | `StrAttr:$device`（"all" 表示全局） |
+
+**默认设备归属**（[DistributePass.cpp](../DistributePass.cpp)）：
+
+```
+host op（函数参数 / arith / print ...） → device = "cpu"
+device_exec 产出                       → device = $device attr
+device_alloc / device_copy              → device 从 attr 推断
+```
+
+**DistributePass `--mydialect-distribute` 核心逻辑**：
+
+1. 构建 `Value → StringRef(device)` 映射表（`devMap`）；
+2. 对每个 `device_exec`，遍历其 region 内所有 op 的 memref operand：
+   - 若 operand 由**不同设备**上的值定义 → 在该 `device_exec` 前自动插入：
+     ```
+     %buf = mydialect.device_alloc "<dev>" : memref<...>
+     mydialect.device_copy %src, %buf : memref<...> -> memref<...>
+     ```
+   - 把 operand 替换为 `%buf`；
+3. `device_copy` 默认同步（不打印 `async` 属性），流水线化 async copy + `device_wait`
+   留作后续 pass 选项（当前实现语义最简单但正确）。
+
+**示例**：两个连续 `device_exec`，`device="gpu"` → `device="hw"`：
+
+```mlir
+// 输入
+%gpu_c = mydialect.device_exec "gpu" : memref<2x4xi32> {
+  mydialect.hw_matmul %A, %B, %C : ...
+  mydialect.device_yield %C : ...
+}
+%hw_out = mydialect.device_exec "hw" : memref<2x5xi32> {
+  mydialect.hw_matmul %gpu_c, %B2, %D : ...
+  mydialect.device_yield %D : ...
+}
+```
+
+经 `--mydialect-distribute` 后：
+
+```mlir
+// host → gpu 的数据搬运（自动插入）
+%0 = mydialect.device_alloc "gpu" : memref<2x3xi32>
+mydialect.device_copy %A, %0 : memref<2x3xi32> -> memref<2x3xi32>
+%1 = mydialect.device_alloc "gpu" : memref<3x4xi32>
+mydialect.device_copy %B, %1 : memref<3x4xi32> -> memref<3x4xi32>
+...
+%gpu_c = mydialect.device_exec "gpu" : memref<2x4xi32> { ... }
+
+// gpu → hw 的跨设备搬运（自动插入）
+%5 = mydialect.device_alloc "hw" : memref<2x4xi32>
+mydialect.device_copy %gpu_c, %5 : memref<2x4xi32> -> memref<2x4xi32>
+
+// host → hw 的数据搬运（自动插入）
+%6 = mydialect.device_alloc "hw" : memref<4x5xi32>
+mydialect.device_copy %B2, %6 : ...
+...
+%hw_out = mydialect.device_exec "hw" : memref<2x5xi32> { ... }
+```
+
+**HAL runtime**（后续接入）：当前 `device_copy` / `device_alloc` / `device_wait` 是 mydialect 原语，不直接依赖外部 HAL 库。后续可在 `LowerDevicePass` 里把它们分别降到：
+
+```
+device_alloc → func.call @mydialect.hal.alloc(device, sizes...)
+device_copy  → func.call @mydialect.hal.copy(src, dst, async)
+device_wait  → func.call @mydialect.hal.wait(device)
+```
+
+函数签名由运行时链接（CUDA / ROCm / TPU runtime）决定，保持 IR 层与设备后端解耦（HAL 风格）。
+
+**约束与后续**：
+- 只支持静态 shape memref（动态 shape 需要先从 `memref.dim` 抽出尺寸再传 `device_alloc` 的 Variadic sizes，后续迭代）；
+- 跨 device 的 `device_copy` 自动插在**生产者 device_exec 之后 / 消费者 device_exec 之前**，但不做 copy 合并/流水线化优化；
+- `PlaceDevicePass` 当前只把 hw 算子标为 `"hw"`，后续可扩展 `--device-type` 让不同算子族落到不同设备（hw_matmul → `"gpu"` / hw_load → `"accel"` / 纯 scalar → `"cpu"`）。
 
 ---
 
