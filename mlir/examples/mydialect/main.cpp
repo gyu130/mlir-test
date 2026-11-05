@@ -6,6 +6,9 @@
 #include "LowerHwMulPass.h"
 #include "OpCountCycleEstimate.h"
 #include "ConcurrentJit.h"
+#include "JitCache.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -254,6 +257,27 @@ static llvm::cl::opt<int> jitOptLevel(
   llvm::cl::desc("JIT LLVM optimization level"),
   llvm::cl::init(2));
 
+static llvm::cl::opt<bool> jitCache(
+  "jit-cache",
+  llvm::cl::desc("Enable JIT bitcode cache: HIT skips MLIR lowering"),
+  llvm::cl::init(false));
+
+static llvm::cl::opt<bool> jitVerbose(
+  "jit-verbose",
+  llvm::cl::desc("Print JIT cache HIT/MISS + time"),
+  llvm::cl::init(false));
+
+static llvm::cl::opt<std::string> jitCacheDir(
+  "jit-cache-dir",
+  llvm::cl::desc("Persist JIT bitcode cache to this dir (<dir>/<key>.bc), "
+                 "cross-process reuse"),
+  llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> aotCompile(
+  "aot-compile",
+  llvm::cl::desc("AOT compile to .so (output path); empty=JIT"),
+  llvm::cl::init(""));
+
 static llvm::cl::list<std::string> jitMlirFiles(
   "jit-mlir-files",
   llvm::cl::desc("MLIR files to run concurrently via JIT"),
@@ -319,6 +343,7 @@ int main(int argc, char** argv) {
 
   mlir::DialectRegistry registry;
   mlir::arith::registerConvertArithToLLVMInterface(registry);
+  mlir::registerConvertMathToLLVMInterface(registry);
   // tensor 方言构造时会级联加载 complex 方言（upstream 行为），
   // 而 complex 声明了 ConvertToLLVMPatternInterface 的 promise；
   // 不注册其实现扩展的话，convert-to-llvm pass 遍历已加载方言时
@@ -409,32 +434,71 @@ int main(int argc, char** argv) {
   }
 
   // ========= 确定入口函数并在 lowering 前捕获原始签名 =========
-  auto entryFunc = module->lookupSymbol<mlir::func::FuncOp>(entryName);
-  if (!entryFunc && !entryNameExplicit) {
-    // 未显式指定且没有 @main：取第一个非声明 func.func
+  // 兼容 func.func（高层）和 llvm.func（已 lowering 到 LLVM dialect）两种入口
+  bool entryIsLLVMFunc = false;
+  mlir::func::FuncOp entryFunc;
+  mlir::LLVM::LLVMFuncOp entryLLVMFunc;
+  if (!entryName.empty()) {
+    entryFunc = module->lookupSymbol<mlir::func::FuncOp>(entryName);
+    if (!entryFunc) {
+      entryLLVMFunc = module->lookupSymbol<mlir::LLVM::LLVMFuncOp>(entryName);
+      if (entryLLVMFunc) entryIsLLVMFunc = true;
+    }
+  }
+  if (!entryFunc && !entryLLVMFunc && !entryNameExplicit) {
+    // 未显式指定入口：优先取第一个 func.func，否则取第一个 llvm.func
     module->walk([&](mlir::func::FuncOp f) {
       if (!entryFunc && !f.isDeclaration()) {
         entryFunc = f;
         entryName = f.getName().str();
       }
     });
+    if (!entryFunc) {
+      module->walk([&](mlir::LLVM::LLVMFuncOp f) {
+        if (!entryLLVMFunc && !f.isDeclaration()) {
+          entryLLVMFunc = f;
+          entryIsLLVMFunc = true;
+          entryName = f.getName().str();
+        }
+      });
+    }
   }
-  if (!entryFunc) {
+  if (!entryFunc && !entryLLVMFunc) {
     llvm::errs() << "Error: cannot find entry func @" << entryName << "\n";
     return 1;
   }
-  llvm::SmallVector<ArgDesc> argDescs, resultDescs;
-  if (!captureSignature(entryFunc, argDescs, resultDescs)) {
-    llvm::errs() << "Error: unsupported argument/result type in entry func @"
-                 << entryName << " (only int/index/f32/f64/static memref/tensor)\n";
-    return 1;
-  }
-  if (resultDescs.size() > 1) {
-    llvm::errs() << "Error: entry func with multiple results not supported\n";
-    return 1;
-  }
 
-  // Pass流水线
+  // ========= 检测 module 是否已 lowering 到 LLVM dialect =========
+  // 如果是，跳过所有 mydialect/arith/scf → LLVM 的 lowering pass，
+  // 直接进入 AOT 或 JIT 阶段（减少不必要的 pass 开销，也避免 mydialect pass
+  // 对纯 LLVM dialect module 做出错误假设）。
+  bool alreadyLLVM = true;
+  module->walk([&](mlir::Operation *op) {
+    if (!alreadyLLVM) return;
+    if (auto *dialect = op->getDialect()) {
+      mlir::StringRef ns = dialect->getNamespace();
+      if (!ns.empty() && ns != "llvm" && ns != "builtin") {
+        alreadyLLVM = false;
+      }
+    }
+  });
+  llvm::SmallVector<ArgDesc> argDescs, resultDescs;
+  if (!alreadyLLVM) {
+    if (!captureSignature(entryFunc, argDescs, resultDescs)) {
+      llvm::errs() << "Error: unsupported argument/result type in entry func @"
+                   << entryName << " (only int/index/f32/f64/static memref/tensor)\n";
+      return 1;
+    }
+    if (resultDescs.size() > 1) {
+      llvm::errs() << "Error: entry func with multiple results not supported\n";
+      return 1;
+    }
+  }
+  // 纯 LLVM dialect 时 argDescs/resultDescs 不填：compileModuleToSharedLib 不依赖签名，
+  // runJitWithCache 也直接 invokePacked，暂不需要预先描述。
+  // 后续如果要支持 JIT 路径的 llvm.func 参数/结果，再补 LLVM dialect 类型 → builtin 类型转换。
+
+  // Pass流水线（仅在还未 lowering 到 LLVM dialect 时运行）
   // opt-level 档位派生：
   //   level>=1 开启局部/图清理优化；level>=2 开启全量图优化；
   //   granular 开关显式给出时优先。
@@ -447,6 +511,7 @@ int main(int argc, char** argv) {
   bool doParallel = resolveToggle(parallelizeMode, level, 2);
   bool doSchedule = resolveToggle(scheduleMode, level, 2);
 
+  if (!alreadyLLVM) {
   mlir::PassManager optPM(&ctx);
   if (doLocalOpts) {
     optPM.addPass(mydialect::createMyOptPass()); // 高层优化Pass
@@ -502,11 +567,55 @@ int main(int argc, char** argv) {
     llvm::errs() << "Lowering to LLVM dialect failed\n";
     return 1;
   }
+  } // !alreadyLLVM
 
   llvm::errs() << "===== lowered IR dump =====\n";
   module->dump();
 
-  // 创建ExecutionEngine
+  // ===== AOT 编译（--aot-compile <path>）=====
+  if (!aotCompile.empty()) {
+    mydialect::AotCompilerOptions aotOpts;
+    aotOpts.outputDir = aotCompile;
+    aotOpts.optLevel = jitOptLevel;
+    auto soOrErr = mydialect::compileModuleToSharedLib(module.get(), aotOpts);
+    if (!soOrErr) {
+      llvm::handleAllErrors(soOrErr.takeError(), [](const llvm::ErrorInfoBase &e) {
+        llvm::errs() << "AOT failed: " << e.message() << "\n";
+      });
+      return 1;
+    }
+    llvm::outs() << "[aot] compiled → " << *soOrErr << "\n";
+    if (!jitMlirFiles.empty()) {
+      auto runOrErr = mydialect::loadAndRunSharedLib(*soOrErr);
+      if (runOrErr) {
+        llvm::outs() << "[aot] main() → " << *runOrErr << "\n";
+      } else {
+        llvm::handleAllErrors(runOrErr.takeError(), [](const llvm::ErrorInfoBase &e) {
+          llvm::errs() << "dlopen/run failed: " << e.message() << "\n";
+        });
+      }
+    }
+    return 0;
+  }
+
+  // ===== 带缓存的 JIT（--jit-cache）=====
+  if (jitCache) {
+    if (!jitCacheDir.empty())
+      mydialect::setJitCachePersistDir(jitCacheDir);
+    auto ownedModule = mlir::OwningOpRef<mlir::ModuleOp>(module.get().clone());
+    auto result = mydialect::runJitWithCache(
+        std::move(ownedModule), jitOptLevel, jitVerbose);
+    if (!result) {
+      llvm::handleAllErrors(result.takeError(), [](const llvm::ErrorInfoBase &e) {
+        llvm::errs() << "runJitWithCache failed: " << e.message() << "\n";
+      });
+      return 1;
+    }
+    llvm::outs() << "[jit-cache] main() → " << *result << "\n";
+    return 0;
+  }
+
+  // 创建ExecutionEngine（默认路径，无缓存）
   mlir::ExecutionEngineOptions engineOptions;
   engineOptions.transformer = mlir::makeOptimizingTransformer(0,0,nullptr);
   llvm::Expected<std::unique_ptr<mlir::ExecutionEngine>> maybeEngine =

@@ -1,7 +1,10 @@
 #include "ConcurrentJit.h"
+#include "JitCache.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Error.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -11,6 +14,7 @@
 #include <thread>
 #include <future>
 #include <vector>
+#include <chrono>
 
 using namespace mlir;
 using namespace llvm;
@@ -28,6 +32,11 @@ static void jitPrintI32(int32_t val) {
 static llvm::StringMap<void*> gExternSymbols = {
   {"print", (void*)jitPrintI32}
 };
+
+// 进程级 JitCache（静态生存期）
+static JitCache gJitCache;
+
+void setJitCachePersistDir(StringRef dir) { gJitCache.setPersistDir(dir.str()); }
 
 llvm::Expected<int64_t> runSingleJitModule(OwningOpRef<ModuleOp> module, int optLevel) {
   ExecutionEngineOptions opts;
@@ -124,6 +133,78 @@ LogicalResult runConcurrentJit(ArrayRef<OwningOpRef<ModuleOp>> modules,
   }
 
   return anyFailed ? failure() : success();
+}
+
+// ============ 带 JitCache 的 JIT ============
+llvm::Expected<int64_t> runJitWithCache(OwningOpRef<ModuleOp> module,
+                                         int optLevel, bool verbose) {
+  using namespace std::chrono;
+  auto t0 = steady_clock::now();
+
+  // 1. 算缓存 key
+  std::string key = gJitCache.computeKey(module.get(), optLevel);
+  JitCache::Bitcode *cached = gJitCache.lookup(key);
+  bool hit = cached != nullptr;
+  if (!hit) {
+    // 未命中：先把 module lowering 成 LLVM bitcode 并写入缓存
+    llvm::Expected<JitCache::Bitcode> bcOrErr = mlirModuleToBitcode(module.get());
+    if (!bcOrErr) return bcOrErr.takeError();
+    gJitCache.insert(key, std::move(*bcOrErr));
+    cached = gJitCache.lookup(key);
+  }
+  if (!cached)
+    return createStringError(inconvertibleErrorCode(),
+                             "jit cache entry missing after insert");
+
+  // 2. 准备 ExecutionEngineOptions
+  ExecutionEngineOptions opts;
+  if (auto level = llvm::CodeGenOpt::getLevel(optLevel))
+    opts.jitCodeGenOptLevel = *level;
+
+  // 3. 注入 llvmModuleBuilder：直接从缓存 bitcode 重建 LLVM module，
+  //    跳过 MLIR lowering。
+  //    注意：llvmModuleBuilder 是 llvm::function_ref，不拥有可调用对象，
+  //    必须把 lambda 存成具名变量，否则临时 lambda 析构后回调悬空 → segfault。
+  auto moduleBuilder = [cached](Operation *, llvm::LLVMContext &ctx)
+      -> std::unique_ptr<llvm::Module> {
+    return mydialect::bitcodeToLLVMModule(
+        StringRef(reinterpret_cast<const char *>(cached->data()),
+                  cached->size()),
+        ctx);
+  };
+  opts.llvmModuleBuilder = moduleBuilder;
+
+  // 4. 建 ExecutionEngine 并执行
+  auto engineOrErr = mlir::ExecutionEngine::create(module.get(), opts);
+  if (!engineOrErr) return engineOrErr.takeError();
+  auto engine = std::move(*engineOrErr);
+
+  engine->registerSymbols([&](llvm::orc::MangleAndInterner interner) {
+    llvm::orc::SymbolMap symbolMap;
+    for (auto &entry : gExternSymbols) {
+      symbolMap[interner(entry.getKey())] = {
+          llvm::orc::ExecutorAddr::fromPtr(entry.getValue()),
+          llvm::JITSymbolFlags::Exported};
+    }
+    symbolMap[interner("my_runtime_print_i32")] = {
+        llvm::orc::ExecutorAddr::fromPtr(jitPrintI32),
+        llvm::JITSymbolFlags::Exported};
+    return symbolMap;
+  });
+
+  int64_t retVal = 0;
+  void *args[] = {&retVal};
+  MutableArrayRef<void*> argRef(args);
+  if (auto err = engine->invokePacked("main", argRef))
+    return std::move(err);
+
+  if (verbose) {
+    auto ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    llvm::outs() << "[jit-cache] " << (hit ? "HIT" : "MISS")
+                 << " cache=" << gJitCache.size()
+                 << " time=" << ms << "ms\n";
+  }
+  return retVal;
 }
 
 } // namespace mydialect

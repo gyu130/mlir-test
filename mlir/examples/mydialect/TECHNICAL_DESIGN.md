@@ -286,6 +286,8 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 | `SchedulePass` | `--mydialect-schedule` | 基本块级 list scheduling（FU + 延迟模型） |
 | `ConvertOnnxToMyDialectPass` | `--convert-onnx-to-mydialect` | ONNX stub → mydialect |
 | `DistributePass` | `--mydialect-distribute` | 跨 `device_exec` 自动插 `device_copy`（分布式/异构数据搬运） |
+| `runJitWithCache` | `--jit-cache --jit-verbose` (mydriver) | 带 bitcode 缓存的 JIT（命中跳过 MLIR lowering） |
+| `compileModuleToSharedLib` | `--aot-compile=<dir>` (mydriver) | AOT 编译为 `.so` 共享库 |
 
 所有 Pass 通过 TableGen `MyDialectPasses.td` / `MyOptPass.td` 声明，并在各自 TU 内静态注册（`static bool _registered = []() { registerXxxPass(); return true; }();`），确保 `mlir-opt` 启动时自动可用。
 
@@ -538,6 +540,91 @@ device_wait  → func.call @mydialect.hal.wait(device)
 - 只支持静态 shape memref（动态 shape 需要先从 `memref.dim` 抽出尺寸再传 `device_alloc` 的 Variadic sizes，后续迭代）；
 - 跨 device 的 `device_copy` 自动插在**生产者 device_exec 之后 / 消费者 device_exec 之前**，但不做 copy 合并/流水线化优化；
 - `PlaceDevicePass` 当前只把 hw 算子标为 `"hw"`，后续可扩展 `--device-type` 让不同算子族落到不同设备（hw_matmul → `"gpu"` / hw_load → `"accel"` / 纯 scalar → `"cpu"`）。
+
+---
+
+### 5.10 JIT 缓存、AOT 编译与增量编译
+
+**问题**：每次 JIT 执行 mydialect 都完整走 MLIR lowering → LLVM IR → 机器码编译链。相同 IR 重复编译浪费时间；部署到无 JIT 环境需要 AOT；变更单个 func 不应重编整个 module。
+
+**实现入口**（[JitCache.h](../JitCache.h) / [JitCache.cpp](../JitCache.cpp)，在 [ConcurrentJit.cpp](../ConcurrentJit.cpp) 接入）：
+
+| 组件 | 作用 |
+|---|---|
+| `JitCache` | bitcode 缓存：key = SHA256(module 文本 + optLevel)，value = LLVM bitcode；支持内存 + 磁盘两级 |
+| `mlirModuleToBitcode()` | MLIR module → `translateModuleToLLVMIR` → `WriteBitcodeToFile` |
+| `bitcodeToLLVMModule()` | bitcode → `parseBitcodeFile` → `llvm::Module`（新 LLVMContext） |
+| `compileModuleToSharedLib()` | MLIR → `.ll` → `llc/clang -c -o .o` → `clang -shared -o .so` |
+| `runJitWithCache()` | 缓存命中检查 → `ExecutionEngineOptions.llvmModuleBuilder` 注入缓存 bitcode |
+
+**JIT 缓存命中机制**（ConcurrentJit 里）：
+
+```cpp
+// key = SHA256(module 文本)
+// 命中：跳过 MLIR lowering，直接把缓存 bitcode 喂给 ExecutionEngine
+// 未命中：mlirModuleToBitcode(module) → 存 cache → 同上路径（先存再用）
+
+// 注意：llvmModuleBuilder 是 llvm::function_ref（不拥有可调用对象），
+// 必须先存成具名变量再赋值；写成 opts.llvmModuleBuilder = [&](...){...}
+// 会让临时 lambda 析构后回调悬空 → ExecutionEngine::create 段错误。
+auto moduleBuilder = [cached](Operation *, llvm::LLVMContext &ctx) {
+  return bitcodeToLLVMModule(bcOf(*cached), ctx);
+};
+opts.llvmModuleBuilder = moduleBuilder;
+```
+
+**磁盘持久化缓存**（跨进程复用，`--jit-cache-dir=<dir>`）：
+
+- `JitCache::setPersistDir(dir)`：`lookup` 先在内存找，未命中再尝试 `MemoryBuffer::getFile("<dir>/<key>.bc")` 并回填内存；`insert` 同时写内存与落盘。
+- 实测同一 module 第二次运行命中：`MISS cache=1 → HIT cache=1`，目录下生成 `297367…b54.bc`（约 1.7 KB）。
+
+核心洞察：MLIR 22 的 `ExecutionEngineOptions` 有 `llvmModuleBuilder` 回调，直接传入 LLVM module 时，**ExecutionEngine 完全跳过 MLIR lowering**（省掉 `translateModuleToLLVMIR` + LLVM IR 验证/规范化）。缓存 bitcode 比缓存 MLIR module 更好，因为 bitcode 直接可 parse，MLIR module 还需 parse + lowering。
+
+**AOT 编译路径**（`--aot-compile=<dir>`）：
+
+```
+MLIR module（已 lowering 到 LLVM dialect）
+  → translateModuleToLLVMIR → llvm::Module
+  → llvmMod->print(fd_ostream) → xxx.ll
+  → clang/llc -c -O<opt> -filetype=obj → xxx.o
+  → clang -shared -o xxx.so
+  （可选） loadAndRunSharedLib → dlopen + dlsym("main") → 执行
+```
+
+用外部 clang/llc 做后端，避开 LLVM 22 与 MLIR 22 之间的 TargetMachine / PassManager API 差异。
+
+**工具链解析优先级**（`resolveProgram`）：绝对路径 → **mydriver 同目录**（`build_mlir/bin/clang`、`bin/llc`，与 mydriver 同为 22.1.8）→ `PATH`。这一顺序是必需的：LLVM 22 生成的 IR 含 `getelementptr inbounds nuw` 等新语法，系统老版本 clang（如 17）会直接报 parse error。此外 `sys::ExecuteAndWait` 不做 PATH 解析，必须先用 `sys::findProgramByName` 转绝对路径，否则报 `posix_spawn failed: No such file or directory`。
+
+**mydriver 新增命令行选项**（[main.cpp](../main.cpp)）：
+
+| 选项 | 作用 |
+|---|---|
+| `--jit-cache` | 启用 JitCache |
+| `--jit-cache-dir=<dir>` | bitcode 落盘到 `<dir>/<key>.bc`，跨进程复用（空 = 纯内存） |
+| `--jit-verbose` | 打印 `[jit-cache] HIT/MISS cache=N time=<ms>` |
+| `--aot-compile=<dir>` | AOT 编译到指定目录；不带此选项则走 JIT |
+
+**端到端流程**（已 lowering 到 LLVM dialect 的 MLIR module）：
+
+```mlir
+mydriver --jit-cache --jit-verbose --parse-mlir lowered_llvm.mlir
+# 首次：[jit-cache] MISS cache=1 time=185ms   ← lowering + compile
+# 再次：[jit-cache] HIT  cache=1 time=42ms    ← bitcode 直接 parse + compile
+```
+
+**编译前提**：`compileModuleToSharedLib` 和 `runJitWithCache` 都假设输入 module 已经 lowering 到 LLVM dialect。mydriver 在 `--parse-mlir` 模式下先检测 `alreadyLLVM`（只含 `llvm`/`builtin` 方言）：是则跳过整条 lowering 流水线直接进 AOT/JIT（否则 `func.func` 已不存在，入口查找会报 `cannot find entry func @main`），否则跑完整 `--convert-to-llvm` 流水线。
+
+**示例**：已 lowering 的 `llvm.func @main` module 可直接 AOT 出 `.so`，`nm -D` 可见 `T main`，`loadAndRunSharedLib` 调用返回 42。
+
+**已加载方言的 ConvertToLLVM 接口**：`--convert-to-llvm` 会遍历所有已加载方言，凡声明了 `ConvertToLLVMPatternInterface` promise 的方言都必须注册实现扩展，否则直接 `LLVM ERROR ... promised by dialect 'math' but never implemented` 并 abort。本项目已注册 `math`/`complex`/`vector` 三个（`registerConvertMathToLLVMInterface` 等），新增方言时需同步检查。
+
+**增量编译（函数级重编）**：
+- 当前 JitCache 粒度是**整个 module**；同一 module 里即使只改了一个 `func.func`，缓存 key 也不同（因为 module 文本变了），会重编整个 module。
+- 函数级增量留作后续迭代：在 LowerMyDialectPrint 里按 `func.func` 拆分 module → 每个 func 独立 lowering → 独立 `JitCache` → 运行时 ORC 动态链接。
+
+**线程安全**：`JitCache` 所有 public 方法都内部加锁（`std::mutex`），ConcurrentJit 多线程并发调用安全。
+
+**缓存失效**：纯内存模式下进程退出即清空（静态对象析构）；指定 `--jit-cache-dir` 后 bitcode 落盘 `<dir>/<key>.bc`，下次进程启动直接读盘命中。key 含 module 文本，因此 module 一变 key 即变，天然不会读到过期产物。
 
 ---
 

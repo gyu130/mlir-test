@@ -72,6 +72,7 @@ add_library(MyDialectLib
   LowerHwMulPass.cpp
   OpCountCycleEstimate.cpp
   ConcurrentJit.cpp
+  JitCache.cpp
 )
 add_dependencies(MyDialectLib MyDialectTableGen OnnxStubTableGen MLIRMyDialectPassesIncGen MyOptPassTableGen MyDialectHwOpsIncGen)
 llvm_process_sources(MyDialectLib PARTIAL_SOURCES_INTENDED)
@@ -129,6 +130,8 @@ target_link_libraries(mydriver
     MLIRUBToLLVM
     MLIRTensorDialect
     MLIRComplexToLLVM
+    MLIRMathToLLVM
+    MLIRMathDialect
     MLIRVectorToLLVM
     MLIRVectorDialect
     MLIRBuiltinToLLVMIRTranslation
