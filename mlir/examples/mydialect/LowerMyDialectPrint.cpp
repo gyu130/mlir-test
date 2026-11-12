@@ -16,11 +16,30 @@
 
 namespace mydialect {
 
-// ========== 自定义 TypeConverter：mydialect 层的类型降级入口 ==========
-// 注意：本 pass 的降级目标是 scf/memref/arith（print 直接到 llvm.call），
-// 不是直接降到 LLVM，因此继承基类 TypeConverter 而不是 LLVMTypeConverter
-// （后者会把 memref 转成 LLVM struct，与本 pass 产生的 memref op 冲突；
-//  memref→LLVM 由后续 --convert-to-llvm pass 用它自己的 converter 完成）。
+// 消除「可通过 TypeConverter 折叠」的 unrealized_conversion_cast：
+//   source=memref, target=MyTensorType → convert(source)=memref, convert(target)=memref → identity，消掉
+// 对 LowerDevicePass GPU 分支插的反向 cast（memref→MyTensorType）特别有用
+struct CastEliminationPattern
+    : public mlir::OpConversionPattern<mlir::UnrealizedConversionCastOp> {
+  using OpConversionPattern::OpConversionPattern;
+  mlir::LogicalResult matchAndRewrite(
+      mlir::UnrealizedConversionCastOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter &rw) const override {
+    if (op.getInputs().size() != 1 || op.getResults().size() != 1)
+      return mlir::failure();
+    mlir::Value src = op.getInputs()[0];
+    mlir::Type srcTy = src.getType();
+    mlir::Type dstTy = op.getResult(0).getType();
+    mlir::Type srcConverted = getTypeConverter()->convertType(srcTy);
+    mlir::Type dstConverted = getTypeConverter()->convertType(dstTy);
+    if (!srcConverted || !dstConverted || srcConverted != dstConverted)
+      return mlir::failure();
+    rw.replaceOp(op, src);
+    return mlir::success();
+  }
+};
+
+// ========== 自定义 TypeConverter ==========
 struct MyDialectTypeConverter : public mlir::TypeConverter {
   MyDialectTypeConverter() {
     // 兜底：其余类型（i32/index/memref/...）保持原样。
@@ -166,10 +185,9 @@ struct LowerMyDialectPrintPass
     target.addLegalDialect<mlir::scf::SCFDialect>();
     target.addLegalDialect<mlir::memref::MemRefDialect>();
     target.addLegalDialect<mlir::math::MathDialect>();
-    // pattern 内手工插入的 unrealized_conversion_cast（wrapped_i32→i32 擦除）
-    // 会作为普通新 op 做合法性检查，必须显式标记合法；
-    // 转换结束时驱动会自动折叠掉已解耦的 cast。
-    target.addLegalOp<mlir::UnrealizedConversionCastOp>();
+    // UnrealizedConversionCastOp 标记为 illegal，让 CastEliminationPattern
+    // 折叠 identity cast（memref↔MyTensorType 等经 converter 后同类型的 cast）
+    target.addIllegalOp<mlir::UnrealizedConversionCastOp>();
 
     // 自定义类型（wrapped_i32/mydialect.tensor）出现时 func.func 签名必须转换：
     // dialect 级 addLegalDialect 不感知操作数类型，需按签名动态判定合法性，
@@ -187,6 +205,8 @@ struct LowerMyDialectPrintPass
     // --- 3. 注册 patterns（converter 在构造时绑定到每个 pattern）---
     mlir::RewritePatternSet patterns(ctx);
     mydialect::populateMyDialectToLowerPatterns(patterns, typeConverter);
+    // identity cast 消除（memref↔MyTensorType 等经 converter 后同类型的 cast）
+    patterns.add<mydialect::CastEliminationPattern>(typeConverter, ctx);
     // func.func 签名重写（承接上面的 addDynamicallyLegalOp）
     mlir::populateFunctionOpInterfaceTypeConversionPattern<mlir::func::FuncOp>(
         patterns, typeConverter);

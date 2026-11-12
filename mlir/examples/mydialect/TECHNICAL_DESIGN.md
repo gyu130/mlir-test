@@ -21,6 +21,8 @@
 13. [编译与运行](#13-编译与运行)
 14. [关键技术决策与经验总结](#14-关键技术决策与经验总结)
 
+> 5.8 GPU 加速路径、5.11 GPU AOT、以及用例 11.12 是最新的 GPU 相关内容。
+
 ---
 
 ## 1. 项目概述
@@ -34,6 +36,7 @@ MyDialect 是一个在 LLVM/MLIR 框架上从零构建的自定义方言（Diale
 - **前端接入**：简化 C 语言解析器、ONNX 模型 IR 转换
 - **执行后端**：单线程 JIT 与多线程并发 JIT
 - **硬件建模**：硬件乘法算子的软件/硬件双 lowering 路径、执行周期估算
+- **GPU 部署**：逐元素张量算子手写 CUDA kernel 生成、fatbin 打包、可部署 ELF AOT
 
 项目位于 `mlir/examples/mydialect/`，最终产物为 `mydriver` 可执行文件与可被 `mlir-opt` 加载的 Pass 库。
 
@@ -287,7 +290,8 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 | `ConvertOnnxToMyDialectPass` | `--convert-onnx-to-mydialect` | ONNX stub → mydialect |
 | `DistributePass` | `--mydialect-distribute` | 跨 `device_exec` 自动插 `device_copy`（分布式/异构数据搬运） |
 | `runJitWithCache` | `--jit-cache --jit-verbose` (mydriver) | 带 bitcode 缓存的 JIT（命中跳过 MLIR lowering） |
-| `compileModuleToSharedLib` | `--aot-compile=<dir>` (mydriver) | AOT 编译为 `.so` 共享库 |
+| `compileModuleToSharedLib` | `--aot-compile=<dir>` (mydriver) | AOT 编译为 `.so` 共享库（host 侧） |
+| GPU AOT | `--gpu-aot=<dir> --device-target=gpu` (mydriver) | 生成带嵌入 fatbin（cubin + PTX）的可部署 ELF（详见 5.11） |
 
 所有 Pass 通过 TableGen `MyDialectPasses.td` / `MyOptPass.td` 声明，并在各自 TU 内静态注册（`static bool _registered = []() { registerXxxPass(); return true; }();`），确保 `mlir-opt` 启动时自动可用。
 
@@ -342,15 +346,29 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 [device]→ PlaceDevicePass
         → LowerHwMulPass            (必须在 LowerMyDialectPrint 之前)
         → OpCountCycleEstimatePass
+
+=== GPU 目标分支（--device-target=gpu）===
+[device]→ LowerDevicePass(GPU)      ← 在张量算子仍存在时 kernel 化
+        ├─ 若 --gpu-aot <dir>：
+        │     → runGpuAot：NVVM pipeline + mlir-translate + clang 链接
+        │     → 输出 <entry>_gpu（含 fatbin 的可部署 ELF）
+        └─ 否则：跳过（LLVM 后端不认识 gpu.launch，用户自行接 GPU pipeline）
+
+=== 非 GPU 目标分支 ===
         → LowerMyDialectPrintPass
-[device]→ LowerDevicePass            (cpu 目标内联 device_exec)
+[device]→ LowerDevicePass(cpu)      ← 在 lowering 之后内联 device_exec
 [graph] → TilePass
 [graph] → ParallelPass
         → LowerAffinePass → Canonicalizer
 [graph] → SchedulePass
         → SCFToControlFlow → ConvertToLLVM
-        → ExecutionEngine JIT
+        → ExecutionEngine JIT 或 --aot-compile=<dir>
 ```
+
+**两次 LowerDevicePass**：GPU 目标需要在张量算子仍存在时执行（才能识别并 kernel 化），
+CPU/其他目标在 lowering 之后执行（内联 `device_exec`）。main.cpp 按
+`deviceTarget` 分支调度。`gpu-aot` 触发时直接走 NVVM pipeline 链出 ELF，
+不再进 `convert-to-llvm`（LLVM 后端不认识 `gpu.launch`）。
 
 `[local]`/`[graph]`/`[device]` 标记的 pass 由 `--opt-level` 档位控制：
 
@@ -366,7 +384,7 @@ SimpleCParser 全程用 MyTensorType 做标量载体，而 `hw_mul` 是纯标量
 
 - **LayoutPropagationPass**：`E(transpose(x,p), transpose(y,p)) → transpose(E(x,y), p)`（N 个输入转换合并为 1 个）；`transpose(transpose(x,p1),p2) → transpose(x,p1∘p2)`（`composed[m]=p1[p2[m]]`）；恒等置换直接消去。布局转换只在非 elementwise 边界（print/reshape/reduce）按需物化。位于算子融合之前，用于暴露可融合链。
 - **FusionElementwisePass**：把 add/mul 张量的 producer-consumer 链合并为单个 `fused_elementwise`（变参输入 + region 内标量计算），lowering 时只生成一个循环 nest，中间结果不落地 memref。
-- **PlaceDevicePass / LowerDevicePass**：以 `hw_mul` 为种子沿纯算子 def-use 双向闭包，把连续设备段包装为 `device_exec`（终止符 `device_yield` 提升逃逸值）；`--device-target=cpu` 时内联回 host（JIT 可执行），其它目标保留 host/device 边界。
+- **PlaceDevicePass / LowerDevicePass**：以 **硬件算子族（hw_*）** + **7 类逐元素张量算子**（add/mul/sub/div/relu/identity/cmpi）为种子，沿纯算子 def-use 双向闭包，把连续设备段包装为 `device_exec`（终止符 `device_yield` 提升逃逸值）；`--device-target=cpu` 时内联回 host（JIT 可执行）；`--device-target=gpu` 时 `LowerDevicePass` 在张量算子上生成手写 `gpu.launch` kernel（详见 5.8）；其它目标保留 host/device 边界。
 - **TilePass**：对最外层 elementwise `scf.for` 做 strip-mine，用 `affine.min` 处理尾块边界。
 - **ParallelPass**：无 iter_args 且无外部调用的循环提升为 `scf.forall`（由 SCFToControlFlow 串行展开）。
 - **SchedulePass**：基本块级 list scheduling，以 store/call/带 region 的 op 为屏障切段，仅在段内重排纯算术与 load，保持依赖不变。
@@ -421,13 +439,25 @@ Affine 路径是 opt-in 的：`affine.for` 还需 `--lower-affine`（AffineToSta
 ### 5.8 GPU 加速路径
 
 `LowerDevicePass` 新增 `target=gpu` 选项，把 `device_exec` region 内的
-`hw_matmul` 替换为手写 `gpu.launch` kernel（`gpu` 方言），形成三条路径：
+硬件算子族与逐元素张量算子替换为手写 `gpu.launch` kernel（`gpu` 方言），形成三条路径：
 
-| hw_matmul 路径 | 触发条件 | 实现 |
-|---|---|---|
-| SW（软件模拟） | `--lower-hw-mul` 默认（无 `use-hardware-path`） | 清零 + `scf.for` 三层循环累加，纯软件模拟矩阵单元 |
-| HW（硬件外调） | `--lower-hw-mul="use-hardware-path=true"` | `func.call @mydialect.hw.matmul`（模块级 private 声明） |
-| **GPU（CUDA kernel）** | `--mydialect-place-device` → `--mydialect-lower-device=target=gpu` | **`gpu.launch` + 手写 kernel**（块/线程 ID + 边界检查 + 内层 K 循环累加） |
+| 算子族 | SW 路径（默认） | HW 路径（外调） | GPU 路径（CUDA kernel） |
+|---|---|---|---|
+| `hw_matmul` | 清零 + 三层 `scf.for` 累加 | `func.call @mydialect.hw.matmul` | 手写 `gpu.launch`（16×16 block） |
+| 逐元素张量（add/mul/sub/div/relu/identity/cmpi） | memref + 嵌套 `scf.for` | — | 手写 `gpu.launch`（grid=ceil(N/256)、block=256） |
+| 标量 HW 算子（hw_mul/hw_add/hw_div/hw_and/hw_or/hw_xor） | `arith.*` | `llvm.call_intrinsic` | 粒度太细，不走 GPU |
+| DMA 搬运（hw_load/hw_store） | `memref.load/store` | `func.call @mydialect.hw.dma.*` | — |
+
+#### 5.8.1 PlaceDevicePass 扩展
+
+PlaceDevicePass 原来只把硬件算子族（`hw_*`）标为设备算子种子。
+为了让张量算子也能被包装进 `device_exec`、从而被 GPU 路径消费，新增
+7 类**逐元素张量算子**作为种子：`AddTensorOp / MulTensorOp / SubTensorOp /
+DivTensorOp / ReluTensorOp / IdentityTensorOp / CmpITensorOp`。
+`MatMulTensorOp / SoftmaxTensorOp / ReduceSumTensorOp / ConvTensorOp` 当前
+不进 GPU 路径（待实现）。
+
+#### 5.8.2 hw_matmul 的 GPU kernel
 
 **GPU kernel 结构**（[LowerDevicePass.cpp](../LowerDevicePass.cpp)）：
 ```
@@ -444,19 +474,124 @@ block = (16, 16, 1)
 M/K/N 用 `memref.dim` 运行时取，天然支持动态 shape；块/线程尺寸 `TB=16`（可调）；
 边界 `if (i<M && j<N)` 处理小矩阵和非整除 tile。
 
-**设计决策**：
-- **当前仅覆盖 `hw_matmul`**（memref 输入输出直接可用）；张量算子（带 `MyTensorType`）
-  的 GPU kernel 化需要先把张量 op lower 成 memref + scf.for，由
-  PlaceDevice → LowerMyDialectPrint → LowerDevice 协同实现，留作后续迭代。
-- 单标量 HW 算子（hw_add/hw_mul/hw_div/hw_and/hw_or/hw_xor/hw_load/hw_store）
-  粒度太细不值得 GPU kernel，保持原样交给 HW 路径（extern call）。
-- **不接 nvvm/rocdl lowering**：`gpu.launch` IR 生成到此为止，后续接
-  `--convert-gpu-to-nvvm` / `--convert-gpu-to-rocdl` 需要配置 target triple
-  和设备 SDK（当前 JIT 走 CPU 后端，不做 GPU runtime）。
-- `device_exec` host/device 边界在 GPU 路径下**保留**（不内联），方便用户识别 kernel 调用点。
+#### 5.8.3 逐元素张量算子的 GPU kernel
 
-**库依赖**：CMakeLists.txt 链接 `MLIRGPUDialect`（含 `gpu.launch` / `gpu.block_id` /
-`gpu.thread_id` / `gpu.terminator` / `gpu.module` 等 op）。
+7 类逐元素算子共享同一份 kernel 模板（`emitElementwiseGpuKernel`）：
+- 把多维输入展平为 flat index，`gridX = ceil(N/256)`、`blockX = 256`
+- 每个 thread 用 `gpu.thread_id.x` 作 flat index，`idx[d] = cur % size[d]; cur /= size[d]` 反解多维下标
+- `if (flatIdx < N)` 越界保护（小尺寸张量天然全 tile）
+- 算完直接 store 到输出 memref 对应位置
+- **动态 shape 跳过 GPU kernel 化**（notifyMatchFailure），保留原 CPU 路径——
+  因为 flat 展开的 `memref.dim` 无法表达为常量 grid 尺寸
+
+**不接 nvvm/rocdl lowering**：`gpu.launch` IR 生成到此为止，后续接
+`mlir-opt --gpu-lower-to-nvvm-pipeline`（见 5.11 GPU AOT）或
+`--convert-gpu-to-rocdl` 需要配置 target triple 和设备 SDK。
+
+**库依赖**：CMakeLists.txt 链接 `MLIRGPUDialect`（含 `gpu.launch` /
+`gpu.block_id` / `gpu.thread_id` / `gpu.terminator` / `gpu.module` 等 op）。
+
+---
+
+### 5.11 GPU AOT：fatbin 打包与可部署 ELF
+
+`--gpu-aot <dir>` 走完整的 **host + NVIDIA 编译**链，本机（无 GPU）产出
+一个带嵌入式 fatbin（cubin + PTX）的独立 ELF，拷到目标机（有 NVIDIA GPU + 驱动）
+直接运行：
+
+```
+onnx → mydialect → PlaceDevice → LowerDevice(GPU)
+        → gpu.launch 高层 IR（.gpu.mlir）
+        → mlir-opt --gpu-lower-to-nvvm-pipeline="
+             cubin-chip=<arch> cubin-features=<isa> cubin-format=fatbin"
+           ← NVVM 内部隐式调用 CUDA toolkit 的 ptxas + fatbinary
+             （需要 CUDA_HOME / CUDA_ROOT / CUDA_PATH 或 /usr/local/cuda）
+        → .nvvm.mlir（gpu.binary 持有 fatbin attribute）
+        → mlir-translate --mlir-to-llvmir → .ll（host 侧 mgpuModuleLoad 等调用）
+        → 生成宿主 main + mgpu_shim.c（CUDA driver API 适配）
+        → clang -O2 .ll host.c mgpu_shim.o -L<toolkit>/lib64/stubs -lcuda
+             （只加 stubs 作为链接时占位，不写 RUNPATH）
+        → <entry>_gpu（独立 ELF）
+```
+
+#### 5.11.1 新增命令行选项
+
+| 选项 | 作用 |
+|---|---|
+| `--gpu-aot <dir>` | 开启 GPU AOT，产物落到 `<dir>`；**必须配合 `--device-target=gpu`** |
+| `--gpu-arch` | 默认 `sm_80` |
+| `--gpu-features` | 空则按 arch 自动推导（sm_70→+ptx60、sm_75→+ptx63、sm_80→+ptx78、sm_100+→+ptx86） |
+| `--gpu-toolkit` | 空则取 CUDA_HOME/CUDA_ROOT/CUDA_PATH，最后回落 `/usr/local/cuda` |
+
+#### 5.11.2 产物结构
+
+```
+<dir>/
+├── <entry>.gpu.mlir        # GPU 高层 IR（gpu.launch + func/memref/arith/scf）
+├── <entry>.nvvm.mlir       # 经 NVVM pipeline 降级后，gpu.binary 持有 fatbin
+├── <entry>.ll              # host 侧 LLVM IR（fatbin 作为全局变量嵌入）
+├── <entry>_host.c          # 宿主 main：malloc + iota 填充输入，调用入口并打印首尾
+├── <entry>_mgpu_shim.c     # CUDA driver API 适配（mgpuModuleLoad / mgpuLaunchKernel 等）
+├── <entry>_mgpu_shim.o     # shim 编译产物
+└── <entry>_gpu             # 最终 ELF（独立可执行）
+```
+
+#### 5.11.3 memref ABI 与宿主 main
+
+每个 memref 参数按 MLIR ABI 展开为 **9 个独立标量**：
+`(allocated, aligned, offset, size[rank]×2, stride[rank]×2)`。
+返回值 memref 按 struct 返回（隐含 sret），宿主 C 侧用 `MemRefDescN` 结构
+拿到结果。`generateGpuHostSource`（[main.cpp](../main.cpp)）按 `ArgDesc`
+自动生成：输入 malloc + iota 填充（`(i+1)`），调用入口，打印 `[0]` 和 `[N-1]`。
+
+#### 5.11.4 mgpu_shim：CUDA driver API 适配
+
+NVVM → LLVM IR 生成的 host 侧调用符号（`mgpuModuleLoad / mgpuModuleUnload /
+mgpuModuleGetFunction / mgpuStreamCreate / mgpuStreamDestroy / mgpuStreamSynchronize /
+mgpuLaunchKernel`）不在任何库里，必须由用户侧提供。项目内置的
+[mgpu_shim.c](../main.cpp) 实现最小适配：把这些 `mgpu*` 符号映射到
+对应 `cuModuleLoadData / cuModuleGetFunction / cuStreamCreate / cuLaunchKernel`
+调用。shim 编译只需要 `<cuda.h>`（CUDA toolkit 头文件，`-I<toolkit>/include`），
+运行时只需要目标机上的 `libcuda.so.1`（driver 提供）。
+
+#### 5.11.5 fatbin：同时包含 cubin + PTX
+
+NVVM pipeline 的 `cubin-format=fatbin`（默认值）让 MLIR 依次：
+1. 用 ptxas 编译到当前 arch 的 cubin
+2. 用 fatbinary 打包 cubin + PTX + 调试信息 成 fatbin
+
+驱动在目标机自动选对 cubin（若架构匹配）或用嵌入 PTX JIT 编译。
+目标机只依赖 driver，**不需要 CUDA toolkit**。
+
+#### 5.11.6 链接注意：禁止 RUNPATH
+
+目标机若装了 CUDA toolkit，`-L<toolkit>/lib64/stubs -lcuda` 链接时
+**不能**同时加 `-Wl,-rpath,<toolkit>/lib64/stubs`——否则动态链接器优先
+命中 stubs 目录里的空实现 `libcuda.so`（所有 `cu*` 函数都是 `return CUDA_ERROR_NOT_INITIALIZED`），
+导致 `cuModuleLoadData` 静默失败。正确做法是**只加 `-L…stubs -lcuda`**
+（不加 rpath），目标机的 driver 路径 `/usr/lib/x86_64-linux-gnu/libcuda.so.1`
+会被系统搜索路径找到。
+
+#### 5.11.7 流水线位置
+
+GPU AOT 在 LowerDevicePass（GPU）之后触发。main.cpp 按目标分两次调
+LowerDevicePass：**GPU 目标在 `LowerMyDialectPrint` 之前执行**
+（此时张量算子仍存在，PlaceDevice 与 LowerDevice 能正确识别并 kernel 化），
+**CPU 目标在 `LowerMyDialectPrint` 之后执行**（用于内联 `device_exec`）。
+
+#### 5.11.8 示例
+
+```bash
+# 本机（无 GPU）编译：产物拷到 GPU 机运行
+mydriver --parse-mlir onnx_add.mlir \
+  --device-target=gpu --gpu-aot out --gpu-arch sm_80
+
+# 目标机直接执行
+scp out/main_graph_gpu gpu-host:
+ssh gpu-host ./main_graph_gpu
+# 输出：[gpu-aot] main_graph[0] = 2.000000
+#       [gpu-aot] main_graph[999] = 2000.000000
+```
 
 ### 5.9 分布式 / 异构执行（HAL 风格）
 
@@ -863,6 +998,57 @@ mydriver --concurrent-jit --jit-mlir-files=a.mlir,b.mlir,c.mlir --jit-threads=4 
 - **`test/device/place_basic.mlir`**：hw_mul 闭包 → `device_exec`/`device_yield`
 - **`test/device/place_cpu_inline.mlir`**：`--mydialect-lower-device target=cpu` 内联 region
 - **`test/device/place_keep_device.mlir`**：非 cpu 目标保留 host/device 边界
+
+### 11.12 GPU AOT 用例
+
+**`onnx.Add` 的端到端 GPU 部署**：
+
+```mlir
+// onnx_add.mlir
+module {
+  func.func @main_graph(%a: tensor<10x10x10xf32>, %b: tensor<10x10x10xf32>)
+      -> tensor<10x10x10xf32> {
+    %0 = "onnx.Add"(%a, %b) :
+        (tensor<10x10x10xf32>, tensor<10x10x10xf32>) -> tensor<10x10x10xf32>
+    return %0 : tensor<10x10x10xf32>
+  }
+}
+```
+
+本机编译（无 GPU 也能做，只需要 CUDA toolkit 的 ptxas + fatbinary）：
+
+```bash
+mydriver --parse-mlir onnx_add.mlir \
+  --device-target=gpu --gpu-aot out --gpu-arch sm_80
+# 产物：out/main_graph_gpu（带 fatbin 的独立 ELF）
+
+readelf -d out/main_graph_gpu | grep -E 'NEEDED|RUNPATH'
+# NEEDED: libcuda.so.1       ← 只需要 driver 提供的占位
+# NEEDED: libc.so.6
+# （没有 RUNPATH，避免目标机误加载 toolkit stubs 的空实现）
+
+strings out/main_graph_gpu | grep -c '.nv.info'    # > 0，cubin 嵌入
+strings out/main_graph_gpu | grep -c '.version 7.8'  # > 0，PTX 也嵌入
+```
+
+拷到 GPU 机器执行：
+
+```bash
+scp out/main_graph_gpu gpu-host:
+ssh gpu-host ./main_graph_gpu
+# [gpu-aot] main_graph[0] = 2.000000
+# [gpu-aot] main_graph[999] = 2000.000000
+```
+
+目标机要求：NVIDIA GPU + 驱动（提供 `libcuda.so.1`），**不需要** CUDA toolkit。
+
+**ONNX Loop 里的 Add 同样能走 GPU 路径**——Loop 先被 onnx→mydialect 转成 `mydialect.loop` + region，region 内的 `onnx.Add` 转成 `AddTensorOp`，被 PlaceDevice 包装进 `device_exec`、LowerDevice(GPU) 生成手写 gpu.launch kernel。见仓库里的 `loop_add.onnx.mlir`。
+
+**lit 测试**（已覆盖 6 个，全部通过）：
+
+- `test/gpu/`：逐元素算子 kernel 生成、device_exec 边界保留、LowerDevice(GPU) 后 IR roundtrip
+- `test/device/`：三种 target（cpu inline / gpu 保留边界 / hw 保留边界）
+- `test/roundtrip/`：mlir parse → mydriver → 输出可 parse 回
 
 ---
 

@@ -1,7 +1,7 @@
 // PlaceDevicePass.cpp：--mydialect-place-device
 // 异构部署的 device placement：
-//   1. 以 mydialect.hw_mul（硬件加速原语）为种子，沿纯 mydialect 算子的
-//      def-use 边做双向闭包，得到「设备子图」；
+//   1. 以 mydialect.hw_*（硬件加速原语）和逐元素张量算子为种子，沿纯
+//      mydialect 算子的 def-use 边做双向闭包，得到「设备子图」；
 //   2. 把同一基本块内连续的设备算子包进 mydialect.device_exec region，
 //      region 内产生、region 外仍要用的值通过 device_yield 提升为结果，
 //      形成 host ↔ device 的流水线边界。
@@ -48,11 +48,18 @@ static bool isHwOp(Operation *op) {
              HwLoadOp, HwStoreOp>(op);
 }
 
-// 以 hw 算子族为种子，沿纯算子 def-use 边做双向闭包（仅同一基本块内）
+// 逐元素张量算子：同样作为种子，供 --mydialect-lower-device=target=gpu
+// 把设备子图替换成手写 gpu.launch kernel
+static bool isTensorOp(Operation *op) {
+  return isa<AddTensorOp, MulTensorOp, SubTensorOp, DivTensorOp, ReluTensorOp,
+             IdentityTensorOp, CmpITensorOp>(op);
+}
+
+// 以 hw / 逐元素张量算子为种子，沿纯算子 def-use 边做双向闭包（仅同一基本块内）
 static void collectDeviceOps(Block &block, llvm::DenseSet<Operation *> &dev) {
   llvm::SmallVector<Operation *, 16> worklist;
   for (Operation &op : block)
-    if (isHwOp(&op))
+    if (isHwOp(&op) || isTensorOp(&op))
       worklist.push_back(&op);
 
   while (!worklist.empty()) {
