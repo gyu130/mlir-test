@@ -11,6 +11,9 @@ void registerMyOptPass();
 std::unique_ptr<mlir::Pass> createFusionElementwisePass();
 // --mydialect-tile：对 elementwise scf.for 做 strip-mining 分块
 std::unique_ptr<mlir::Pass> createTilePass();
+// --mydialect-linalg-opt：对 lowering 生成的 linalg.generic 做分块
+// （linalg::tileLinalgOp），随后由 --convert-linalg-to-loops 降回 scf.for
+std::unique_ptr<mlir::Pass> createLinalgOptimizePass();
 // --mydialect-loop-optimize：循环融合 / 交换 / 向量化
 std::unique_ptr<mlir::Pass> createLoopOptimizePass();
 // --mydialect-for-to-affine：把 mydialect.for 降级为 affine.for

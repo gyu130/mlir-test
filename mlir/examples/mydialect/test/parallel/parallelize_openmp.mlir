@@ -1,4 +1,4 @@
-// RUN: %mlir-opt --lower-mydialect-print --mydialect-parallelize --scf-forall-to-parallel --convert-scf-to-openmp %s | %FileCheck %s
+// RUN: %mlir-opt --lower-mydialect-print --convert-linalg-to-loops --mydialect-parallelize --scf-forall-to-parallel --convert-scf-to-openmp %s | %FileCheck %s
 // OpenMP 后端：scf.forall → scf.parallel → omp.parallel / omp.wsloop / omp.loop_nest
 module {
   func.func @main(%a : !mydialect.tensor<[64],i32>,

@@ -94,6 +94,7 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/MyOptPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/FusionPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/TilePass.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/LinalgOptimizePass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LoopOptimizePass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LowerAffineForPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/AffineOptimizePass.cpp
@@ -141,4 +142,7 @@ mlir_target_link_libraries(mlir-opt PRIVATE
   MLIRGPUDialect
   MLIRGPUTransforms
   MLIRGPUUtils
+  MLIRLinalgDialect
+  MLIRLinalgUtils
+  MLIRLinalgTransforms
 )

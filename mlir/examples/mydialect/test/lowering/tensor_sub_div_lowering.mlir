@@ -1,6 +1,8 @@
-// RUN: %mlir-opt --lower-mydialect-print %s | %FileCheck %s
+// RUN: %mlir-opt --lower-mydialect-print --convert-linalg-to-loops %s | %FileCheck %s
 //
 // sub_tensor / div_tensor: 与 add_tensor / mul_tensor 完全同构
+// 先降为 linalg.generic（buffer 语义），再由 --convert-linalg-to-loops 降回
+// 循环 nest：
 // 整数 → arith.subi / arith.divsi
 // 浮点 → arith.subf / arith.divf
 

@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
@@ -957,14 +958,20 @@ int main(int argc, char** argv) {
   optPM.addPass(mydialect::createLowerHwMulPass(hwLowerMode.getValue()));
   optPM.addPass(mydialect::createOpCountCycleEstimatePass());
   optPM.addPass(mydialect::createLowerMyDialectPrint());
+  // Linalg 优化：LowerMyDialectPrint 把逐元素算子与 matmul 发射成
+  // linalg.generic / linalg.matmul。先做 linalg 分块，再统一降回 scf.for，
+  // 后续 schedule / SCF→CF / LLVM 链路保持原样。
+  if (doGraphOpts)
+    optPM.addPass(mydialect::createLinalgOptimizePass());
+  optPM.addPass(mlir::createConvertLinalgToLoopsPass());
   // 边界落地：cpu 目标内联 device_exec（设备算子退回 host 执行）；
   // gpu 目标在 kernel 生成后同样内联，让 gpu.launch 直接位于 func 内，
   // 便于后续 --gpu-lower-to-nvvm-pipeline 之类的标准 GPU 后端处理
   if (doPlaceDevice)
     optPM.addPass(mydialect::createLowerDevicePass(
         gpuDeviceTarget ? "cpu" : deviceTarget.getValue()));
-  // 分块：对 lowering 生成的 elementwise scf.for 做 strip-mining
-  // （必须在 LowerMyDialectPrint 之后，loop 才存在）
+  // 分块：兜底处理其余 lowering 产生的 elementwise scf.for 做 strip-mining
+  // （linalg 生成的分块循环 step≠1，会被该 pass 跳过）
   if (doGraphOpts)
     optPM.addPass(mydialect::createTilePass());
   // 并行化：tile 之后把最外层分块循环提升为 scf.forall

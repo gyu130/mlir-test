@@ -1,6 +1,7 @@
-// RUN: %mlir-opt --lower-mydialect-print --mydialect-tile %s | %FileCheck %s
-// Phase 2.2：一维 elementwise 循环 strip-mining
-// 外层步长 = tile-size(32)，内层上界 = affine.min，索引 = io + ii
+// RUN: %mlir-opt --lower-mydialect-print --mydialect-linalg-opt --convert-linalg-to-loops %s | %FileCheck %s
+// 一维 elementwise 分块：--mydialect-linalg-opt 调用 linalg::tileLinalgOp
+// 对 linalg.generic 的最外层循环分块（tile-size=32），再由
+// --convert-linalg-to-loops 降回 scf.for。
 module {
   func.func @main(%a : !mydialect.tensor<[64],i32>,
                   %b : !mydialect.tensor<[64],i32>) -> !mydialect.tensor<[64],i32> {
@@ -9,15 +10,15 @@ module {
   }
 }
 
-// CHECK: #map = affine_map<(d0)[s0] -> (32, -d0 + s0)>
 // CHECK-LABEL: func.func @main
 // CHECK: scf.for %[[IO:.*]] = %c0 to %c64 step %c32 {
-// CHECK-NEXT: %[[UB:.*]] = affine.min #map(%[[IO]])[%c64]
-// CHECK-NEXT: scf.for %[[II:.*]] = %c0 to %[[UB]] step %c1 {
-// CHECK-NEXT: %[[IDX:.*]] = arith.addi %[[IO]], %[[II]] : index
-// CHECK-NEXT: %[[L0:.*]] = memref.load %arg0[%[[IDX]]]
-// CHECK-NEXT: %[[L1:.*]] = memref.load %arg1[%[[IDX]]]
+// CHECK-NEXT: %[[SV0:.*]] = memref.subview %arg0[%[[IO]]] [32] [1]
+// CHECK-NEXT: %[[SV1:.*]] = memref.subview %arg1[%[[IO]]] [32] [1]
+// CHECK-NEXT: %[[SVO:.*]] = memref.subview %alloc[%[[IO]]] [32] [1]
+// CHECK-NEXT: scf.for %[[II:.*]] = %c0 to %c32 step %c1 {
+// CHECK-NEXT: %[[L0:.*]] = memref.load %[[SV0]][%[[II]]]
+// CHECK-NEXT: %[[L1:.*]] = memref.load %[[SV1]][%[[II]]]
 // CHECK-NEXT: %[[ADD:.*]] = arith.addi %[[L0]], %[[L1]]
-// CHECK-NEXT: memref.store %[[ADD]], %alloc[%[[IDX]]]
-// 分块后只有两个循环、一次 store（原循环被搬进内层）
+// CHECK-NEXT: memref.store %[[ADD]], %[[SVO]][%[[II]]]
+// 原 linalg op 已被删除：只剩内层一次 store，无未分块的重复计算
 // CHECK-NOT: memref.store

@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -99,6 +101,31 @@ static mlir::memref::AllocOp allocMemrefLike(
       dynamicSizes.push_back(getMemrefDim(rw, loc, srcForDims, d));
   }
   return mlir::memref::AllocOp::create(rw, loc, resTy, dynamicSizes);
+}
+
+// ============ linalg 发射 helper ============
+// 把「逐元素」计算表达为 buffer 语义的 linalg.generic：
+//   - inputs/outputs 都是 memref，indexing map 全为 identity，
+//     iterator types 全为 parallel（rank==0 时退化为 0 个循环）；
+//   - body 回调拿到每个操作数（输入 + 输出）的标量元素，返回值作为 yield。
+// 表达成 linalg 后可直接复用 linalg::tileLinalgOp 等标准变换，
+// 最后由 --convert-linalg-to-loops 统一降回嵌套 scf.for。
+static mlir::linalg::GenericOp emitLinalgGeneric(
+    mlir::ConversionPatternRewriter &rw, mlir::Location loc,
+    mlir::ValueRange inputs, mlir::Value output,
+    llvm::function_ref<mlir::Value(mlir::OpBuilder &, mlir::Location,
+                                   mlir::ValueRange)> body) {
+  mlir::MLIRContext *ctx = rw.getContext();
+  int64_t rank = mlir::cast<mlir::MemRefType>(output.getType()).getRank();
+  llvm::SmallVector<mlir::AffineMap> maps(
+      inputs.size() + 1, mlir::AffineMap::getMultiDimIdentityMap(rank, ctx));
+  llvm::SmallVector<mlir::utils::IteratorType> iters(
+      rank, mlir::utils::IteratorType::parallel);
+  return mlir::linalg::GenericOp::create(
+      rw, loc, mlir::TypeRange{}, inputs, mlir::ValueRange{output}, maps, iters,
+      [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+        mlir::linalg::YieldOp::create(b, l, body(b, l, args));
+      });
 }
 
 // ============ WrapOp: mydialect.wrap i32→wrapped_i32，降级时透传 ============
@@ -894,9 +921,9 @@ struct ConstantTensorOpLowering
   }
 };
 
-// ============ AddTensorOp: mydialect.add_tensor → memref 逐元素加法 ============
-// adaptor 操作数已是 memref；为结果分配新 memref，按静态 shape 生成嵌套
-// scf.for（0 维张量无循环直接 load/add/store），结果写入新分配的 memref。
+// ============ AddTensorOp: mydialect.add_tensor → linalg.generic 逐元素加法 ============
+// adaptor 操作数已是 memref；为结果分配新 memref，再发射 buffer 语义的
+// linalg.generic（identity map + parallel 迭代），body 内做 arith.addi/addf。
 struct AddTensorOpLowering
     : public mlir::OpConversionPattern<mydialect::AddTensorOp> {
   using mlir::OpConversionPattern<mydialect::AddTensorOp>::OpConversionPattern;
@@ -911,24 +938,20 @@ struct AddTensorOpLowering
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
-      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value sum = mlir::isa<mlir::IntegerType>(elemTy)
-        ? (mlir::Value)mlir::arith::AddIOp::create(rewriter, loc, lv, rv)
-        : (mlir::Value)mlir::arith::AddFOp::create(rewriter, loc, lv, rv);
-      rewriter.create<mlir::memref::StoreOp>(loc, sum, res, idxs);
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{lhs, rhs}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      if (mlir::isa<mlir::IntegerType>(elemTy))
+        return mlir::arith::AddIOp::create(b, l, args[0], args[1]).getResult();
+      return mlir::arith::AddFOp::create(b, l, args[0], args[1]).getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
 };
 
-// ============ MulTensorOp: mydialect.mul_tensor → memref 逐元素乘法 ============
-// 与 AddTensorOpLowering 同构（C 前端 7*6 与 ONNX Mul 都会产生 mul_tensor）：
-// adaptor 操作数已是 memref；0 维张量无循环直接 load/mul/store，
-// 多维张量按静态 shape 生成嵌套 scf.for
+// ============ MulTensorOp: mydialect.mul_tensor → linalg.generic 逐元素乘法 ============
+// 与 AddTensorOpLowering 同构（C 前端 7*6 与 ONNX Mul 都会产生 mul_tensor）
 struct MulTensorOpLowering
     : public mlir::OpConversionPattern<mydialect::MulTensorOp> {
   using mlir::OpConversionPattern<mydialect::MulTensorOp>::OpConversionPattern;
@@ -943,21 +966,19 @@ struct MulTensorOpLowering
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
-      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value prod = mlir::isa<mlir::IntegerType>(elemTy)
-        ? (mlir::Value)mlir::arith::MulIOp::create(rewriter, loc, lv, rv)
-        : (mlir::Value)mlir::arith::MulFOp::create(rewriter, loc, lv, rv);
-      rewriter.create<mlir::memref::StoreOp>(loc, prod, res, idxs);
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{lhs, rhs}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      if (mlir::isa<mlir::IntegerType>(elemTy))
+        return mlir::arith::MulIOp::create(b, l, args[0], args[1]).getResult();
+      return mlir::arith::MulFOp::create(b, l, args[0], args[1]).getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
 };
 
-// ============ SubTensorOp: mydialect.sub_tensor → 同构 Add/Mul，arith.subi/subf ============
+// ============ SubTensorOp: mydialect.sub_tensor → linalg.generic（subi/subf）============
 struct SubTensorOpLowering
     : public mlir::OpConversionPattern<mydialect::SubTensorOp> {
   using mlir::OpConversionPattern<mydialect::SubTensorOp>::OpConversionPattern;
@@ -972,22 +993,20 @@ struct SubTensorOpLowering
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
-      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value diff = mlir::isa<mlir::IntegerType>(elemTy)
-        ? (mlir::Value)mlir::arith::SubIOp::create(rewriter, loc, lv, rv)
-        : (mlir::Value)mlir::arith::SubFOp::create(rewriter, loc, lv, rv);
-      rewriter.create<mlir::memref::StoreOp>(loc, diff, res, idxs);
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{lhs, rhs}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      if (mlir::isa<mlir::IntegerType>(elemTy))
+        return mlir::arith::SubIOp::create(b, l, args[0], args[1]).getResult();
+      return mlir::arith::SubFOp::create(b, l, args[0], args[1]).getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
 };
 
-// ============ DivTensorOp: mydialect.div_tensor → 同构 Add/Mul，arith.divis/divf ============
-// 注：整数除法走 DivSIOp（有符号）；无静态除零 verifier（逐元素除零是运行时语义）。
+// ============ DivTensorOp: mydialect.div_tensor → linalg.generic（divsi/divf）============
+// 注：整数除法走 DivSIOp（有符号）；逐元素除零属运行时语义，不做静态校验。
 struct DivTensorOpLowering
     : public mlir::OpConversionPattern<mydialect::DivTensorOp> {
   using mlir::OpConversionPattern<mydialect::DivTensorOp>::OpConversionPattern;
@@ -1002,25 +1021,23 @@ struct DivTensorOpLowering
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
     mlir::Type elemTy = resTy.getElementType();
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
-      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value q = mlir::isa<mlir::IntegerType>(elemTy)
-        ? (mlir::Value)mlir::arith::DivSIOp::create(rewriter, loc, lv, rv)
-        : (mlir::Value)mlir::arith::DivFOp::create(rewriter, loc, lv, rv);
-      rewriter.create<mlir::memref::StoreOp>(loc, q, res, idxs);
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{lhs, rhs}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      if (mlir::isa<mlir::IntegerType>(elemTy))
+        return mlir::arith::DivSIOp::create(b, l, args[0], args[1]).getResult();
+      return mlir::arith::DivFOp::create(b, l, args[0], args[1]).getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
 };
 
-// ============ FusedElementwiseOp: → 单个循环 nest + 内联 region 标量计算 ============
-// 与 AddTensorOpLowering 同构地生成循环骨架；循环体内不再固定 add/mul，
-// 而是把 fused region 的标量表达式按块参数映射内联（clone + IRMapping），
-// fused_yield 的值 store 到结果 memref。多次融合只产生一个循环 nest，
-// 这就是融合的收益：中间结果不再落地 memref。
+// ============ FusedElementwiseOp: → 单个 linalg.generic + 内联 region 标量计算 ============
+// 融合体本身就是一个逐元素计算：发射一个 linalg.generic，body 内把 region 的
+// 标量表达式按「块参数 → generic 标量参数」映射内联（clone + IRMapping），
+// fused_yield 的值作为 linalg.yield 的操作数。多次融合只产生一个 generic，
+// 中间结果不再落地 memref，这就是融合的收益。
 struct FusedElementwiseOpLowering
     : public mlir::OpConversionPattern<mydialect::FusedElementwiseOp> {
   using mlir::OpConversionPattern<
@@ -1037,33 +1054,32 @@ struct FusedElementwiseOpLowering
     for (mlir::Value v : adaptor.getInputs())
       inputs.push_back(ensureMemref(v, tc, rewriter, loc));
     auto res = allocMemrefLike(rewriter, loc, resTy, inputs.front());
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::IRMapping mapping;
-      mlir::Block &blk = op.getBody().front();
-      for (auto [arg, in] : llvm::zip(blk.getArguments(), inputs)) {
-        mlir::Value elem =
-            rewriter.create<mlir::memref::LoadOp>(loc, in, idxs);
-        mapping.map(arg, elem);
-      }
-      mlir::Value result;
-      for (mlir::Operation &inner : blk) {
-        if (auto y = mlir::dyn_cast<mydialect::FusedYieldOp>(inner)) {
-          result = mapping.lookup(y.getValue());
-          continue;
-        }
-        rewriter.clone(inner, mapping);
-      }
-      rewriter.create<mlir::memref::StoreOp>(loc, result, res, idxs);
-    });
+    emitLinalgGeneric(
+        rewriter, loc, inputs, res,
+        [&](mlir::OpBuilder &b, mlir::Location l,
+            mlir::ValueRange args) -> mlir::Value {
+          mlir::IRMapping mapping;
+          mlir::Block &blk = op.getBody().front();
+          for (auto [arg, in] : llvm::zip(blk.getArguments(), args))
+            mapping.map(arg, in);
+          mlir::Value result;
+          for (mlir::Operation &inner : blk) {
+            if (auto y = mlir::dyn_cast<mydialect::FusedYieldOp>(inner)) {
+              result = mapping.lookup(y.getValue());
+              continue;
+            }
+            b.clone(inner, mapping);
+          }
+          return result;
+        });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
 };
 
-// ============ CmpITensorOp: mydialect.cmpi_tensor → memref 逐元素比较 ============
+// ============ CmpITensorOp: mydialect.cmpi_tensor → linalg.generic 逐元素比较 ============
 // predicate 采用 arith::CmpIPredicate 枚举值（eq=0..uge=9），直接 static_cast。
-// 结果 memref 元素类型为 i1，逐元素 load-lhs/rhs → arith.cmpi → store。
+// 结果 memref 元素类型为 i1，generic body 内 arith.cmpi 后 yield i1。
 struct CmpITensorOpLowering
     : public mlir::OpConversionPattern<mydialect::CmpITensorOp> {
   using mlir::OpConversionPattern<mydialect::CmpITensorOp>::OpConversionPattern;
@@ -1084,12 +1100,11 @@ struct CmpITensorOpLowering
     mlir::Value lhs = ensureMemref(adaptor.getLhs(), tc, rewriter, loc);
     mlir::Value rhs = ensureMemref(adaptor.getRhs(), tc, rewriter, loc);
     auto res = allocMemrefLike(rewriter, loc, resTy, lhs);
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value lv = rewriter.create<mlir::memref::LoadOp>(loc, lhs, idxs);
-      mlir::Value rv = rewriter.create<mlir::memref::LoadOp>(loc, rhs, idxs);
-      mlir::Value cmp = mlir::arith::CmpIOp::create(rewriter, loc, pred, lv, rv);
-      rewriter.create<mlir::memref::StoreOp>(loc, cmp, res, idxs);
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{lhs, rhs}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      return mlir::arith::CmpIOp::create(b, l, pred, args[0], args[1])
+          .getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
@@ -1272,39 +1287,37 @@ struct ReluTensorOpLowering
     auto res = allocMemrefLike(rewriter, loc, resTy, src);
     mlir::Type elemTy = resTy.getElementType();
 
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
-      mlir::Value zero;
-      if (mlir::isa<mlir::IntegerType>(elemTy)) {
-        zero = mlir::arith::ConstantOp::create(
-            rewriter, loc, rewriter.getZeroAttr(elemTy));
-        auto flag = mlir::arith::CmpIOp::create(
-            rewriter, loc, mlir::arith::CmpIPredicate::sgt, x, zero);
-        auto relu = mlir::arith::SelectOp::create(rewriter, loc, flag, x, zero);
-        rewriter.create<mlir::memref::StoreOp>(loc, relu, res, idxs);
-      } else if (mlir::isa<mlir::FloatType>(elemTy)) {
-        zero = mlir::arith::ConstantOp::create(
-            rewriter, loc, rewriter.getZeroAttr(elemTy));
-        auto flag = mlir::arith::CmpFOp::create(
-            rewriter, loc, mlir::arith::CmpFPredicate::OGT, x, zero);
-        auto relu = mlir::arith::SelectOp::create(rewriter, loc, flag, x, zero);
-        rewriter.create<mlir::memref::StoreOp>(loc, relu, res, idxs);
-      } else {
-        rewriter.notifyMatchFailure(op, "unsupported element type for relu");
-      }
+    if (!mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy))
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported element type for relu");
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{src}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      mlir::Value x = args[0];
+      mlir::Value zero =
+          mlir::arith::ConstantOp::create(b, l, b.getZeroAttr(elemTy))
+              .getResult();
+      mlir::Value flag;
+      if (mlir::isa<mlir::IntegerType>(elemTy))
+        flag = mlir::arith::CmpIOp::create(
+                   b, l, mlir::arith::CmpIPredicate::sgt, x, zero)
+                   .getResult();
+      else
+        flag = mlir::arith::CmpFOp::create(
+                   b, l, mlir::arith::CmpFPredicate::OGT, x, zero)
+                   .getResult();
+      return mlir::arith::SelectOp::create(b, l, flag, x, zero).getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();
   }
 };
 
-// ============ MatMulTensorOp: mydialect.matmul_tensor → 3 层循环 ============
+// ============ MatMulTensorOp: mydialect.matmul_tensor → linalg.fill + linalg.matmul ============
 // Y[M,N] = Σ_k A[m,k] * B[k,n]
 // 实现：
-//   1) 分配 Y[M,N]，清零（memref.alloc 不保证零初始化）
-//   2) 外层 m,n 遍历输出位置
-//   3) 内层 k 累加：Y[m,n] += A[m,k] * B[k,n]
+//   1) 分配 Y[M,N]，用 linalg.fill 清零（memref.alloc 不保证零初始化）
+//   2) 发射 linalg.matmul，累加写入 outs(%Y)
 // 约束：rank=2 静态 shape（由 verifier 保证）。
 struct MatMulTensorOpLowering
     : public mlir::OpConversionPattern<mydialect::MatMulTensorOp> {
@@ -1322,58 +1335,20 @@ struct MatMulTensorOpLowering
 
     if (!aTy.hasStaticShape() || !bTy.hasStaticShape())
       return rewriter.notifyMatchFailure(op, "dynamic shape not supported");
-    int64_t M = aTy.getShape()[0];
-    int64_t K = aTy.getShape()[1];
-    int64_t N = bTy.getShape()[1];
     mlir::Type elemTy = resTy.getElementType();
 
     auto Y = allocMemrefLike(rewriter, loc, resTy, A);
     auto zeroVal = mlir::arith::ConstantOp::create(
         rewriter, loc, rewriter.getZeroAttr(elemTy));
 
-    // 1) 清零 Y（M*N 次，用 emitLoopNest 两层）
-    emitLoopNestMemref(rewriter, loc, Y,
-                 [&](llvm::ArrayRef<mlir::Value> mnIvs) {
-      rewriter.create<mlir::memref::StoreOp>(loc, zeroVal, Y, mnIvs);
-    });
+    // 1) 清零 Y：linalg.fill（buffer 语义原地填充）
+    mlir::linalg::FillOp::create(rewriter, loc, mlir::ValueRange{zeroVal},
+                                 mlir::ValueRange{Y.getResult()});
 
-    // 2) m, n 外层循环（遍历输出位置）
-    auto c0 = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
-    auto cK = mlir::arith::ConstantIndexOp::create(rewriter, loc, K);
-    auto c1 = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+    // 2) Y = A * B：命名结构化算子，结果累加到 outs(%Y)
+    mlir::linalg::MatmulOp::create(rewriter, loc, mlir::ValueRange{A, B},
+                                   mlir::ValueRange{Y.getResult()});
 
-    // 为嵌套 m 循环建立 insert guard
-    mlir::OpBuilder::InsertionGuard outerGuard(rewriter);
-
-    // --- m 循环 ---
-    auto mLoop = mlir::scf::ForOp::create(rewriter, loc, c0,
-        mlir::arith::ConstantIndexOp::create(rewriter, loc, M), c1);
-    auto mIv = mLoop.getInductionVar();
-    rewriter.setInsertionPointToStart(mLoop.getBody());
-
-    // --- n 循环 ---
-    auto nLoop = mlir::scf::ForOp::create(rewriter, loc, c0,
-        mlir::arith::ConstantIndexOp::create(rewriter, loc, N), c1);
-    auto nIv = nLoop.getInductionVar();
-    rewriter.setInsertionPointToStart(nLoop.getBody());
-
-    // --- k 循环（累加）---
-    auto kLoop = mlir::scf::ForOp::create(rewriter, loc, c0, cK, c1);
-    auto kIv = kLoop.getInductionVar();
-    rewriter.setInsertionPointToStart(kLoop.getBody());
-
-    mlir::Value aEl = rewriter.create<mlir::memref::LoadOp>(loc, A, mlir::ValueRange{mIv, kIv});
-    mlir::Value bEl = rewriter.create<mlir::memref::LoadOp>(loc, B, mlir::ValueRange{kIv, nIv});
-    mlir::Value prod = mlir::isa<mlir::IntegerType>(elemTy)
-      ? (mlir::Value)mlir::arith::MulIOp::create(rewriter, loc, aEl, bEl)
-      : (mlir::Value)mlir::arith::MulFOp::create(rewriter, loc, aEl, bEl);
-    mlir::Value acc = rewriter.create<mlir::memref::LoadOp>(loc, Y, mlir::ValueRange{mIv, nIv});
-    mlir::Value sum = mlir::isa<mlir::IntegerType>(elemTy)
-      ? (mlir::Value)mlir::arith::AddIOp::create(rewriter, loc, acc, prod)
-      : (mlir::Value)mlir::arith::AddFOp::create(rewriter, loc, acc, prod);
-    rewriter.create<mlir::memref::StoreOp>(loc, sum, Y, mlir::ValueRange{mIv, nIv});
-
-    // k / n / m scf.for 默认会自动 yield，无需额外操作
     rewriter.replaceOp(op, Y.getResult());
     return mlir::success();
   }
@@ -1620,13 +1595,12 @@ struct ReduceMaxTensorOpLowering
   }
 };
 
-// ========== ExpTensorOp: exp_tensor → 循环 + math.exp ==========
+// ========== ExpTensorOp: exp_tensor → linalg.generic + math.exp ==========
 struct ExpTensorOpLowering
     : public mlir::OpConversionPattern<mydialect::ExpTensorOp> {
   using mlir::OpConversionPattern<mydialect::ExpTensorOp>::OpConversionPattern;
   mlir::LogicalResult matchAndRewrite(
-      mydialect::ExpTensorOp op,
-      mydialect::ExpTensorOp::Adaptor adaptor,
+      mydialect::ExpTensorOp op, mydialect::ExpTensorOp::Adaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     const auto &tc = *getTypeConverter();
@@ -1634,11 +1608,10 @@ struct ExpTensorOpLowering
         tc.convertType(op.getRes().getType()));
     mlir::Value src = ensureMemref(adaptor.getX(), tc, rewriter, loc);
     auto res = allocMemrefLike(rewriter, loc, resTy, src);
-    emitLoopNestMemref(rewriter, loc, res,
-                 [&](llvm::ArrayRef<mlir::Value> idxs) {
-      mlir::Value x = rewriter.create<mlir::memref::LoadOp>(loc, src, idxs);
-      mlir::Value ex = rewriter.create<mlir::math::ExpOp>(loc, x);
-      rewriter.create<mlir::memref::StoreOp>(loc, ex, res, idxs);
+    emitLinalgGeneric(rewriter, loc, mlir::ValueRange{src}, res,
+                      [&](mlir::OpBuilder &b, mlir::Location l,
+                          mlir::ValueRange args) -> mlir::Value {
+      return mlir::math::ExpOp::create(b, l, args[0]).getResult();
     });
     rewriter.replaceOp(op, res.getResult());
     return mlir::success();

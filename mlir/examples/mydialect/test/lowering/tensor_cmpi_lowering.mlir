@@ -1,6 +1,6 @@
-// RUN: %mlir-opt --lower-mydialect-print %s | %FileCheck %s
+// RUN: %mlir-opt --lower-mydialect-print --convert-linalg-to-loops %s | %FileCheck %s
 //
-// cmpi_tensor: 逐元素整数比较 → memref 循环 + arith.cmpi
+// cmpi_tensor: 逐元素整数比较 → linalg.generic → memref 循环 + arith.cmpi
 // 结果 memref 元素类型为 i1，predicate 采用 arith 枚举（0=eq, 1=ne, ..., 9=uge）
 
 module {

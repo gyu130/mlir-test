@@ -1,5 +1,6 @@
-// RUN: %mlir-opt --lower-mydialect-print --mydialect-parallelize %s | %FileCheck %s
-// Phase 3：无迭代携带、无外部调用的 elementwise 循环提升为 scf.forall
+// RUN: %mlir-opt --lower-mydialect-print --convert-linalg-to-loops --mydialect-parallelize %s | %FileCheck %s
+// Phase 3：elementwise 算子先降为 linalg.generic，再降回 scf.for，
+// 最后把无迭代携带、无外部调用的循环提升为 scf.forall
 module {
   func.func @main(%a : !mydialect.tensor<[64],i32>,
                   %b : !mydialect.tensor<[64],i32>) -> !mydialect.tensor<[64],i32> {

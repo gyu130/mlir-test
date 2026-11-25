@@ -57,6 +57,7 @@ add_library(MyDialectLib
   MyOptPass.cpp
   FusionPass.cpp
   TilePass.cpp
+  LinalgOptimizePass.cpp
   LoopOptimizePass.cpp
   LowerAffineForPass.cpp
   AffineOptimizePass.cpp
@@ -94,6 +95,9 @@ target_link_libraries(MyDialectLib
     MLIRAffineUtils
     MLIRSCFDialect
     MLIRVectorDialect
+    MLIRLinalgDialect
+    MLIRLinalgUtils
+    MLIRLinalgTransforms
     MLIRGPUDialect
     MLIRGPUTransforms
     MLIRGPUUtils
@@ -134,6 +138,9 @@ target_link_libraries(mydriver
     MLIRMathDialect
     MLIRVectorToLLVM
     MLIRVectorDialect
+    MLIRLinalgDialect
+    MLIRLinalgUtils
+    MLIRLinalgTransforms
     MLIRBuiltinToLLVMIRTranslation
     MLIRAffineToStandard
     LLVMX86AsmParser

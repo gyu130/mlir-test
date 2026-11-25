@@ -1,6 +1,7 @@
-// RUN: %mlir-opt --convert-onnx-to-mydialect %s | %mlir-opt --lower-mydialect-print | %FileCheck %s
+// RUN: %mlir-opt --convert-onnx-to-mydialect %s | %mlir-opt --lower-mydialect-print --convert-linalg-to-loops | %FileCheck %s
 //
-// ONNX Sub/Div → mydialect.sub_tensor / div_tensor → memref + scf.for 同构 lowering
+// ONNX Sub/Div → mydialect.sub_tensor / div_tensor → linalg.generic →
+// memref + scf.for 同构 lowering
 
 module {
   func.func @test_sub(%a: tensor<2x3xi32>, %b: tensor<2x3xi32>) -> tensor<2x3xi32> {
@@ -48,7 +49,7 @@ module {
 // CHECK-NOT: mydialect.div_tensor
 // CHECK-NOT: mydialect.add_tensor
 // CHECK-NOT: mydialect.mul_tensor
-// CHECK: arith.subi
-// CHECK: arith.divsi
 // CHECK: arith.addi
 // CHECK: arith.muli
+// CHECK: arith.subi
+// CHECK: arith.divsi

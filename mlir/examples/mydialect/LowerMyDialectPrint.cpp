@@ -5,6 +5,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -105,7 +106,8 @@ struct LowerMyDialectPrintPass
                     mlir::arith::ArithDialect,
                     mlir::scf::SCFDialect,
                     mlir::memref::MemRefDialect,
-                    mlir::math::MathDialect>();
+                    mlir::math::MathDialect,
+                    mlir::linalg::LinalgDialect>();
   }
 
   void runOnOperation() override {
@@ -185,6 +187,9 @@ struct LowerMyDialectPrintPass
     target.addLegalDialect<mlir::scf::SCFDialect>();
     target.addLegalDialect<mlir::memref::MemRefDialect>();
     target.addLegalDialect<mlir::math::MathDialect>();
+    // 张量算子的 lowering 现在发射 linalg.generic / linalg.matmul，
+    // 由后续 --mydialect-linalg-opt / --convert-linalg-to-loops 处理
+    target.addLegalDialect<mlir::linalg::LinalgDialect>();
     // UnrealizedConversionCastOp 标记为 illegal，让 CastEliminationPattern
     // 折叠 identity cast（memref↔MyTensorType 等经 converter 后同类型的 cast）
     target.addIllegalOp<mlir::UnrealizedConversionCastOp>();
