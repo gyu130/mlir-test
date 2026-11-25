@@ -129,6 +129,27 @@ void mydialect::MyTensorType::print(mlir::AsmPrinter &printer) const {
   printer << "], " << getElementType() << ">";
 }
 
+// 物化常量：default folding（OperationFolder / SCCP）折叠出属性后，会回调
+// 本方法把属性转成 SSA 值。缺少该 override 时 mydialect 标量算子的 fold
+// 结果无法物化而被丢弃，导致 --canonicalize/--sccp 折叠不到 mydialect 运算。
+mlir::Operation *MyDialect::materializeConstant(mlir::OpBuilder &builder,
+                                                mlir::Attribute value,
+                                                mlir::Type type,
+                                                mlir::Location loc) {
+  // 标量整数/浮点常量：借用 arith.constant（builin 类型）
+  if (mlir::isa<mlir::IntegerAttr, mlir::FloatAttr>(value) &&
+      mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::IndexType>(type))
+    return mlir::arith::ConstantOp::create(builder, loc, type,
+                                           mlir::cast<mlir::TypedAttr>(value));
+
+  // 张量常量：mydialect.constant_tensor 承载 ElementsAttr
+  if (auto elements = mlir::dyn_cast<mlir::ElementsAttr>(value);
+      elements && mlir::isa<MyTensorType>(type))
+    return ConstantTensorOp::create(builder, loc, type, elements);
+
+  return nullptr;
+}
+
 void MyDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const {
   if (auto wrappedTy = mlir::dyn_cast<mydialect::WrappedI32Type>(type)) {
     printer << "wrapped_i32";

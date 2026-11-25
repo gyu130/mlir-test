@@ -7,6 +7,10 @@ include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/BuiltinTypes.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+// RegionBranchOpInterface / RegionBranchTerminatorOpInterface：
+// 让 sccp / canonicalize 能沿 region 边界（循环回边、device_exec 边界）
+// 传播常量（见 ForOp/LoopOp/DeviceExecOp 及其终止符）
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 
 def MyDialect : Dialect {
   let name = "mydialect";
@@ -18,6 +22,12 @@ def MyDialect : Dialect {
     /// 解析/打印自定义类型（wrapped_i32）
     ::mlir::Type parseType(::mlir::DialectAsmParser &parser) const override;
     void printType(::mlir::Type type, ::mlir::DialectAsmPrinter &printer) const override;
+    /// 物化常量：Folder/SCCP 折叠 mydialect 标量算子后，需要方言把属性
+    /// 转回 SSA 常量，否则折叠结果因无法物化而被丢弃。
+    ::mlir::Operation *materializeConstant(::mlir::OpBuilder &builder,
+                                           ::mlir::Attribute value,
+                                           ::mlir::Type type,
+                                           ::mlir::Location loc) override;
   }];
 }
 
@@ -144,7 +154,12 @@ def CmpiOp : Op<MyDialect, "cmpi", [Pure]> {
   let hasVerifier = 1;
 }
 
-def ForOp : Op<MyDialect, "for"> {
+def ForOp : Op<MyDialect, "for", [
+  // 描述 region 分支语义：入口/回边都进入 body，零次迭代直接退出到结果。
+  // 实现见 mydialect-ops.cpp，打通 sccp 的跨 region 常量传播。
+  DeclareOpInterfaceMethods<RegionBranchOpInterface,
+      ["getEntrySuccessorOperands"]>
+]> {
   // 普通循环边界 + 可选 iter_args 初始值
   let arguments = (ins I32:$lower, I32:$upper, I32:$step,
                    Variadic<I32>:$iter_args);
@@ -165,7 +180,9 @@ def ForOp : Op<MyDialect, "for"> {
 
 // YieldOp：支持多个返回值，作为ForOp的terminator
 def YieldOp : Op<MyDialect, "yield",
-      [Terminator, ParentOneOf<["ForOp"]>]> {
+      [Terminator, ParentOneOf<["ForOp"]>,
+       DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface,
+                                 ["getMutableSuccessorOperands"]>]> {
   let arguments = (ins Variadic<I32>:$values);
   let results = (outs);
   let assemblyFormat = "(` ` $values^ `:` type($values))? attr-dict";

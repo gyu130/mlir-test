@@ -10,6 +10,8 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+// RegionBranchOpInterface / RegionBranchTerminatorOpInterface
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 
 
 // TableGen 生成的 Dialect 声明（class MyDialect 等）

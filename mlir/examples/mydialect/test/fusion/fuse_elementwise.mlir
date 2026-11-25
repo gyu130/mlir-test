@@ -11,6 +11,17 @@ module {
     %1 = mydialect.add_tensor %0, %c : !mydialect.tensor<[4],i32>
     return %1 : !mydialect.tensor<[4],i32>
   }
+
+  // 组内多用：%0(mul) 有两个使用者（%1、%2），但都在同一融合组内，
+  // 吸收它不产生复制，body 内 mul 只计算一次并被两处 add 复用。
+  func.func @multi_use_in_group(%a : !mydialect.tensor<[4],i32>,
+                                %b : !mydialect.tensor<[4],i32>,
+                                %c : !mydialect.tensor<[4],i32>) -> !mydialect.tensor<[4],i32> {
+    %0 = mydialect.mul_tensor %a, %b : !mydialect.tensor<[4],i32>
+    %1 = mydialect.add_tensor %0, %c : !mydialect.tensor<[4],i32>
+    %2 = mydialect.add_tensor %0, %1 : !mydialect.tensor<[4],i32>
+    return %2 : !mydialect.tensor<[4],i32>
+  }
 }
 
 // CHECK-LABEL: func.func @main
@@ -21,5 +32,14 @@ module {
 // CHECK: %[[S:.*]] = arith.addi %[[M]], %[[C]] : i32
 // CHECK: mydialect.fused_yield %[[S]] : i32
 // CHECK: return %[[F]] : !mydialect.tensor<[4], i32>
+// CHECK-NOT: mydialect.mul_tensor
+// CHECK-NOT: mydialect.add_tensor
+
+// 组内多用：mul 只计算一次，两个 add 复用同一 muli 结果
+// CHECK-LABEL: func.func @multi_use_in_group
+// CHECK: mydialect.fused_elementwise %arg0, %arg1, %arg2
+// CHECK: %[[M:.*]] = arith.muli
+// CHECK: arith.addi %[[M]],
+// CHECK: arith.addi %[[M]],
 // CHECK-NOT: mydialect.mul_tensor
 // CHECK-NOT: mydialect.add_tensor

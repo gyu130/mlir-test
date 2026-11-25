@@ -56,6 +56,8 @@ add_library(MyDialectLib
   LowerMyDialectPrint.cpp
   MyOptPass.cpp
   FusionPass.cpp
+  GraphRewritePass.cpp
+  LICMPass.cpp
   TilePass.cpp
   LinalgOptimizePass.cpp
   LoopOptimizePass.cpp
@@ -84,6 +86,7 @@ target_link_libraries(MyDialectLib
     MLIRIR
     MLIRParser
     MLIRSupport
+    MLIRControlFlowInterfaces
     MLIRFuncDialect
     MLIRArithDialect
     MLIRMemRefDialect

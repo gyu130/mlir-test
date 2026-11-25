@@ -129,7 +129,13 @@ def HwStoreOp : Op<MyDialect, "hw_store", []> {
 // device_exec 把分配到设备（如硬件加速器）的算子包成一个 region，
 // 构成 host ↔ device 的流水线边界；region 内产生的、region 外仍要用的值
 // 通过 device_yield 提升为该 op 的结果。
-def DeviceExecOp : Op<MyDialect, "device_exec", [SingleBlock]> {
+def DeviceExecOp : Op<MyDialect, "device_exec", [
+  SingleBlock,
+  // region 分支语义：入口进入 body（body 无块参数），device_yield 退出到结果。
+  // 实现见 mydialect-ops.cpp，供 sccp 在 device 边界做常量传播。
+  DeclareOpInterfaceMethods<RegionBranchOpInterface,
+      ["getEntrySuccessorOperands"]>
+]> {
   let summary = "Host/device execution boundary for heterogeneous placement";
   let description = [{
     Groups ops placed on a target device into a single-block region.
@@ -151,7 +157,10 @@ def DeviceExecOp : Op<MyDialect, "device_exec", [SingleBlock]> {
 def DeviceYieldOp : Op<MyDialect, "device_yield", [
   Pure,
   Terminator,
-  ParentOneOf<["DeviceExecOp"]>
+  ParentOneOf<["DeviceExecOp"]>,
+  // device_yield 的操作数即 device_exec 的结果
+  DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface,
+                            ["getMutableSuccessorOperands"]>
 ]> {
   let arguments = (ins Variadic<AnyType>:$values);
   let results = (outs);

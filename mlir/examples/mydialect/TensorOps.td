@@ -323,7 +323,11 @@ def SoftmaxTensorOp : Op<MyDialect, "softmax_tensor", [
 // 终止符在 IR 中显式书写，由 LoopOp::verify() 校验其为 LoopYieldOp。
 def LoopOp : Op<MyDialect, "loop", [
   Pure,
-  SingleBlock
+  SingleBlock,
+  // region 分支语义：入口/回边进入 body（body 块参数约定 (iter, cond, carries...)），
+  // 也可直接退出到结果。实现见 mydialect-ops.cpp。
+  DeclareOpInterfaceMethods<RegionBranchOpInterface,
+      ["getEntrySuccessorOperands"]>
 ]> {
   let arguments = (ins
     I64:$maxTripCount,               // 最大迭代次数，标量 i64
@@ -343,7 +347,10 @@ def LoopOp : Op<MyDialect, "loop", [
 def LoopYieldOp : Op<MyDialect, "loop_yield", [
   Pure,
   Terminator,
-  ParentOneOf<["LoopOp"]>
+  ParentOneOf<["LoopOp"]>,
+  // 回边转发 (cond, carries...)，退出时只转发 carries 作为结果
+  DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface,
+                            ["getMutableSuccessorOperands"]>
 ]> {
   let arguments = (ins
     AnyType:$cond,

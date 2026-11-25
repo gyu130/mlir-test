@@ -94,6 +94,30 @@ LogicalResult DeviceExecOp::verify() {
   return success();
 }
 
+// ---------------- DeviceExecOp: RegionBranchOpInterface ----------------
+// device_exec 总是进入 body（body 无块参数，直接使用外层 SSA 值），
+// device_yield 退出到 op 结果。
+void DeviceExecOp::getSuccessorRegions(RegionBranchPoint point,
+                                       SmallVectorImpl<RegionSuccessor> &regions) {
+  if (point.isParent()) {
+    regions.push_back(
+        RegionSuccessor(&getBody(), getBody().front().getArguments()));
+    return;
+  }
+  regions.push_back(RegionSuccessor(getOperation(), getResults()));
+}
+
+OperandRange DeviceExecOp::getEntrySuccessorOperands(RegionSuccessor) {
+  // device_exec 没有转发进 region 的操作数
+  auto end = getOperation()->operand_end();
+  return OperandRange(end, end);
+}
+
+// device_yield 的操作数即 device_exec 的结果
+MutableOperandRange DeviceYieldOp::getMutableSuccessorOperands(RegionSuccessor) {
+  return MutableOperandRange(*this);
+}
+
 // ---------------- DeviceCopyOp ----------------
 LogicalResult DeviceCopyOp::verify() {
   auto srcTy = dyn_cast<mlir::MemRefType>(getSrc().getType());
@@ -360,6 +384,29 @@ LogicalResult ForOp::verify() {
   return success();
 }
 
+// ---------------- ForOp: RegionBranchOpInterface ----------------
+// 分支语义与 scf.for 一致：
+//   - 入口（parent）可能进入 body，也可能零次迭代直接退出到结果；
+//   - 回边（yield）可能继续到 body，也可能退出到结果。
+// body 块参数为 (iv, iter_args...)，分支只转发 iter_args（iv 由循环自身生成），
+// 因此 region successor 的 inputs 显式取 getRegionIterArgs()。
+void ForOp::getSuccessorRegions(RegionBranchPoint point,
+                                SmallVectorImpl<RegionSuccessor> &regions) {
+  regions.push_back(
+      RegionSuccessor(&getBody(), getBody().getArguments().drop_front()));
+  regions.push_back(RegionSuccessor(getOperation(), getResults()));
+}
+
+OperandRange ForOp::getEntrySuccessorOperands(RegionSuccessor successor) {
+  // 进入 body：初始值成为 iter_args 块参数；零次迭代退出：初始值即结果
+  return getIterArgs();
+}
+
+// yield 的所有操作数同时回边给 iter_args 块参数并作为循环结果
+MutableOperandRange YieldOp::getMutableSuccessorOperands(RegionSuccessor) {
+  return MutableOperandRange(*this);
+}
+
 // ---------------- LoopOp ----------------
 LogicalResult LoopOp::verify() {
   Region &bodyRegion = getBody();
@@ -404,6 +451,40 @@ LogicalResult LoopOp::verify() {
       return emitOpError("yield carry tensor type mismatch with loop result type");
   }
   return success();
+}
+
+// ---------------- LoopOp: RegionBranchOpInterface ----------------
+// body 块参数约定（ONNX Loop 形态）：(iter, cond, carries...)，
+// 个数与 op 操作数 (maxTripCount, initCond, initArgs...) 相同。
+//   - 入口：只把 initArgs 转发给 carries。initCond 是标量 i1 而 cond 块参数
+//     通常是 0 维张量，类型不一致无法映射，保守跳过（cond 只由回边喂入）。
+//   - 回边：loop_yield 的 (newCond, newCarries) 全部转发给 (cond, carries)。
+// 块参数不是该形态时（如无块参数的手写循环）保守地不建模 body 边。
+void LoopOp::getSuccessorRegions(RegionBranchPoint point,
+                                 SmallVectorImpl<RegionSuccessor> &regions) {
+  if (!getBody().empty()) {
+    Block &entry = getBody().front();
+    if (entry.getNumArguments() == getNumOperands()) {
+      auto args = entry.getArguments();
+      regions.push_back(RegionSuccessor(
+          &getBody(), point.isParent() ? args.drop_front(2) : args.drop_front(1)));
+    }
+  }
+  // 退出：loop_yield 的 carries 即 op 结果
+  regions.push_back(RegionSuccessor(getOperation(), getResults()));
+}
+
+OperandRange LoopOp::getEntrySuccessorOperands(RegionSuccessor successor) {
+  // 进入 body：初始 carry 成为 carries 块参数；零次迭代退出：初始 carry 即结果
+  return getInitArgs();
+}
+
+MutableOperandRange
+LoopYieldOp::getMutableSuccessorOperands(RegionSuccessor successor) {
+  // 退出到结果只转发 carries；回边转发 (cond, carries)
+  if (successor.isParent())
+    return getCarryArgsMutable();
+  return MutableOperandRange(*this);
 }
 
 // ---------------- MatMulTensorOp ----------------

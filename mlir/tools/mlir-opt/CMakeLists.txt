@@ -93,6 +93,8 @@ add_mlir_tool(mlir-opt
   ${MLIR_SOURCE_DIR}/examples/mydialect/LowerMyDialectPrint.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/MyOptPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/FusionPass.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/GraphRewritePass.cpp
+  ${MLIR_SOURCE_DIR}/examples/mydialect/LICMPass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/TilePass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LinalgOptimizePass.cpp
   ${MLIR_SOURCE_DIR}/examples/mydialect/LoopOptimizePass.cpp
